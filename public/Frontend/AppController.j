@@ -345,17 +345,32 @@ var BackendBaseURL = @"";
 - (void)loadMailboxesData:(id)data
 {
     [_summaryRows removeAllObjects];
+    
     if (data && data.length > 0) {
         for (var i = 0; i < data.length; i++) {
             var box = data[i];
+            
+            // Flexibler Zugriff auf groß- und kleingeschriebene JSON-Keys
+            var accountName = box.Account || box.account || @"-";
+            var mailboxName = box.Name || box.name || @"-";
+            
+            // Sichere Auswertung des Unread-Status
+            var unreadVal = @"0";
+            if (box.UnreadCount !== undefined) {
+                unreadVal = box.UnreadCount + @"";
+            } else if (box.unreadCount !== undefined) {
+                unreadVal = box.unreadCount + @"";
+            }
+            
             var rowDict = [CPDictionary dictionaryWithObjectsAndKeys:
-                box.account || @"-", @"account",
-                box.name || @"-", @"name",
-                (box.unreadCount !== undefined ? box.unreadCount : @"0") + @"", @"unreadCount"
+                accountName, @"account",
+                mailboxName, @"name",
+                unreadVal, @"unreadCount"
             ];
             [_summaryRows addObject:rowDict];
         }
     }
+    
     [_summaryTableView reloadData];
 }
 

@@ -324,6 +324,7 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 my @cli_args = ('messages', 'list', '-a', $acc, '-m', $box, '--limit', $lim);
                 push @cli_args, '--unread' if $args->{unread};
                 $result_text = run_mail_cli(@cli_args) || "[]";
+                warn $result_text;
             }
             elsif ($func_name eq 'show_message_details') {
                 my $id  = $args->{message_id};
@@ -373,12 +374,35 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
 
 # Fetches configured accounts & mailboxes dynamically for left panel view
 get '/api/mailboxes' => sub ($c) {
-    my $res = run_mail_cli('mailboxes', 'list');
-    my $data = eval { decode_json($res) };
-    if ($@ || !$data) {
-        # Fallback empty list if cli is not configured or fails
-        $data = [];
+    $c->app->log->info("[DEBUG Backend] Rufe 'mail-app-cli mailboxes list' auf...");
+
+    my $res_bytes = run_mail_cli('mailboxes', 'list');
+
+    # Rohe Bytes sauber als UTF-8 Zeichenkette decodieren für die Terminal-Protokollierung
+    my $res_chars = eval { Encode::decode_utf8($res_bytes) } // $res_bytes;
+
+    if (defined $res_chars) {
+        $c->app->log->debug("[DEBUG Backend] Roher CLI-Output (UTF-8 decodiert):\n" . $res_chars);
+    } else {
+        $c->app->log->error("[DEBUG Backend] CLI lieferte keinen Output.");
     }
+
+    my $data = eval { decode_json($res_bytes) };
+    if ($@) {
+        my $err = $@;
+        $c->app->log->error("[DEBUG Backend] JSON-Parsing fehlgeschlagen: " . $err);
+        return $c->render(json => {
+            error      => "Ungültiges JSON vom Mail-CLI erhalten",
+            details    => $err,
+            raw_output => $res_chars // ''
+        }, status => 500);
+    }
+
+    if (ref $data eq 'ARRAY') {
+        my $count = scalar @$data;
+        $c->app->log->info("[DEBUG Backend] Erfolgreich $count Mailbox-Einträge geparst.");
+    }
+
     $c->render(json => $data);
 };
 
