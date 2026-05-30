@@ -40,8 +40,101 @@ sub run_mail_cli {
     # Safely escape shell arguments
     my @escaped = map { my $s = $_; $s =~ s/'/'\\''/g; "'$s'" } @args;
     my $cmd = "$binary " . join(" ", @escaped) . " 2>&1";
+    warn $cmd;
     my $stdout = `$cmd`;
+    warn $stdout;
     return $stdout;
+}
+
+# ==========================================
+# HELPER: Spotlight .emlx Parser & Searcher
+# ==========================================
+sub parse_emlx {
+    my ($path) = @_;
+    open my $fh, '<:encoding(UTF-8)', $path or return;
+    
+    my $first_line = <$fh>;
+    return unless defined $first_line;
+    chomp $first_line;
+    
+    # Apple Mail .emlx begins with the size of the email raw content in bytes
+    my $msg_size = int($first_line);
+    return unless $msg_size > 0;
+    
+    my $email_raw;
+    read($fh, $email_raw, $msg_size);
+    close $fh;
+    
+    # Extract headers (From, To, Subject, Date)
+    my %headers;
+    my @lines = split(/\r?\n/, $email_raw);
+    my $current_header = '';
+    
+    for my $line (@lines) {
+        last if $line eq ''; # Headers section ended
+        
+        if ($line =~ /^([a-zA-Z0-9\-]+):\s*(.*)$/) {
+            $current_header = lc($1);
+            $headers{$current_header} = $2;
+        } elsif ($line =~ /^\s+(.*)$/ && $current_header) {
+            # Continued header line (folding)
+            $headers{$current_header} .= ' ' . $1;
+        }
+    }
+    
+    my (undef, undef, $filename) = File::Spec->splitpath($path);
+    my $id = $filename;
+    $id =~ s/\.emlx$//;
+    
+    return {
+        id      => $id,
+        subject => $headers{subject} // '(No Subject)',
+        from    => $headers{from} // '(Unknown Sender)',
+        to      => $headers{to} // '',
+        date    => $headers{date} // '',
+        path    => $path
+    };
+}
+
+sub run_spotlight_search {
+    my ($query, $limit) = @_;
+    $limit //= 10;
+    
+    my $mail_dir = File::Spec->catdir($ENV{HOME}, 'Library', 'Mail');
+    unless (-d $mail_dir) {
+        $mail_dir = $ENV{HOME}; # Fallback to Home if typical Mail directory is missing
+    }
+    
+    # Escape single quotes within the query for Spotlight's expression format
+    my $escaped_query = $query;
+    $escaped_query =~ s/'/\\'/g;
+    
+    # Build query expression targeting only macOS mail files (.emlx) matching the term
+    my $spotlight_expr = "kMDItemContentType == 'com.apple.mail.emlx' && $escaped_query";
+    
+    # Shell single-quote escape
+    my $safe_expr = $spotlight_expr;
+    $safe_expr =~ s/'/'\\''/g;
+    
+    my $cmd = "mdfind -onlyin '$mail_dir' '$safe_expr' 2>/dev/null";
+    warn "Running Spotlight Search: $cmd";
+    
+    my $stdout = `$cmd`;
+    my @paths = split(/\r?\n/, $stdout);
+    
+    my @results;
+    my $count = 0;
+    for my $path (@paths) {
+        next unless -f $path;
+        last if $count >= $limit;
+        
+        my $meta = parse_emlx($path);
+        if ($meta) {
+            push @results, $meta;
+            $count++;
+        }
+    }
+    return \@results;
 }
 
 # ==========================================
@@ -60,11 +153,26 @@ my @available_tools = (
         type     => 'function',
         function => {
             name        => 'search_messages',
-            description => 'Searches for messages matching a query string across all mailboxes.',
+            description => 'Searches for messages matching a query string across all mailboxes using mail-app-cli.',
             parameters  => {
                 type       => 'object',
                 properties => {
                     query => { type => 'string', description => 'The search query or keyword.' },
+                    limit => { type => 'integer', description => 'Maximum results. Defaults to 10.' }
+                },
+                required => ['query']
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'spotlight_search_messages',
+            description => 'Performs a deep search of local email files (.emlx) on macOS using the Spotlight indexing system (mdfind). Highly effective for finding historical data, specific phrases, or contents inside attachments.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    query => { type => 'string', description => 'The term, phrase, or metadata to search for.' },
                     limit => { type => 'integer', description => 'Maximum results. Defaults to 10.' }
                 },
                 required => ['query']
@@ -319,6 +427,12 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 my $lim = $args->{limit} // 10;
                 $result_text = run_mail_cli('search', $q, '--limit', $lim) || "[]";
             }
+            elsif ($func_name eq 'spotlight_search_messages') {
+                my $q = $args->{query};
+                my $lim = $args->{limit} // 10;
+                my $results = run_spotlight_search($q, $lim);
+                $result_text = encode_json($results);
+            }
             elsif ($func_name eq 'list_messages') {
                 my $acc = $args->{account};
                 my $box = $args->{mailbox};
@@ -423,7 +537,7 @@ post '/api/chat' => sub ($c) {
                {
                    role    => 'system',
                    content => "You are an intelligent email archivist and assistant for macOS Mail.app.\n"
-                            . "You have access to a suite of tools that run commands via mail-app-cli to query, view, archive, and send emails.\n\n"
+                            . "You have access to a suite of tools that run commands via mail-app-cli and Spotlight (mdfind) to query, view, archive, and send emails.\n\n"
                             . "Always explain your actions clearly, format email lists nicely, and answer user queries with precise context obtained from your tools."
                }
            ]
