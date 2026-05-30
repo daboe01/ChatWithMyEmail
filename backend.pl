@@ -285,9 +285,11 @@ helper load_session_data => sub ($c, $session_id) {
 # RECURSIVE AGENT TOOL CALLING LOOP
 # ==========================================
 sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
-    if ($step >= 6) {
+    my $max_steps = $llm_config->{max_steps} // 5;
+
+    if ($step > $max_steps) {
         return Mojo::Promise->resolve({
-            output   => "Maximum analysis steps reached.",
+            output   => "Maximum analysis steps ($max_steps) reached.",
             attempts => $step
         });
     }
@@ -324,7 +326,6 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 my @cli_args = ('messages', 'list', '-a', $acc, '-m', $box, '--limit', $lim);
                 push @cli_args, '--unread' if $args->{unread};
                 $result_text = run_mail_cli(@cli_args) || "[]";
-                warn $result_text;
             }
             elsif ($func_name eq 'show_message_details') {
                 my $id  = $args->{message_id};
