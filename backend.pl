@@ -45,6 +45,19 @@ sub run_mail_cli {
 }
 
 # ==========================================
+# HELPER: Safe fruitmail Execution
+# ==========================================
+sub run_fruitmail_cli {
+    my (@args) = @_;
+    my $binary = "fruitmail"; # Assumes fruitmail is available in system PATH
+    # Safely escape shell arguments
+    my @escaped = map { my $s = $_; $s =~ s/'/'\\''/g; "'$s'" } @args;
+    my $cmd = "$binary " . join(" ", @escaped) . " 2>&1";
+    my $stdout = `$cmd`;
+    return $stdout;
+}
+
+# ==========================================
 # DEFINITION OF TOOLS (JSON SCHEMA)
 # ==========================================
 my @available_tools = (
@@ -135,6 +148,73 @@ my @available_tools = (
                 },
                 required => ['account', 'to', 'subject', 'body']
             }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'fruitmail_search',
+            description => 'Fast local SQLite search on Apple Mail.app using fruitmail-cli. Returns a list of matching messages with database row IDs. Can filter by subject, sender, days limit, or unread status.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    subject => { type => 'string', description => 'Filter by subject line.' },
+                    sender  => { type => 'string', description => 'Filter by sender address/name.' },
+                    days    => { type => 'integer', description => 'Limit search to emails from the last N days.' },
+                    unread  => { type => 'boolean', description => 'Filter for unread messages only.' },
+                    limit   => { type => 'integer', description => 'Maximum results (default: 10).' },
+                    offset  => { type => 'integer', description => 'Result offset for pagination.' }
+                }
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'fruitmail_get_unread',
+            description => 'Quickly lists unread emails from local Apple Mail.app database using fruitmail-cli.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    limit => { type => 'integer', description => 'Maximum results (default: 10).' }
+                }
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'fruitmail_get_body',
+            description => 'Read the full email body of a specific local message ID via AppleScript through fruitmail-cli.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    message_id => { type => 'string', description => 'The local database ID of the message (e.g., 604066).' }
+                },
+                required => ['message_id']
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'fruitmail_open_message',
+            description => 'Opens a specific email inside macOS Mail.app by its local fruitmail database ID.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    message_id => { type => 'string', description => 'The local database ID of the message.' }
+                },
+                required => ['message_id']
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'fruitmail_get_stats',
+            description => 'Retrieves SQLite database statistics for the local Apple Mail database via fruitmail.',
+            parameters  => { type => 'object', properties => {} }
         }
     }
 );
@@ -346,6 +426,39 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 my $body = $args->{body};
                 $result_text = run_mail_cli('send', '-a', $acc, '-t', $to, '-s', $sub, '--body', $body) || '{"status":"sent"}';
             }
+            # --- FRUITMAIL CLI TOOLS ---
+            elsif ($func_name eq 'fruitmail_search') {
+                my @cli_args = ();
+                # If only sender is provided, use dedicated sender action, otherwise build search
+                if ($args->{sender} && !$args->{subject} && !$args->{days} && !$args->{unread}) {
+                    @cli_args = ('sender', $args->{sender});
+                    push @cli_args, '--limit', $args->{limit} // 10;
+                } else {
+                    @cli_args = ('search');
+                    push @cli_args, '--subject', $args->{subject} if $args->{subject};
+                    push @cli_args, '--sender', $args->{sender} if $args->{sender};
+                    push @cli_args, '--days', $args->{days} if $args->{days};
+                    push @cli_args, '--unread' if $args->{unread};
+                    push @cli_args, '--limit', $args->{limit} // 10;
+                    push @cli_args, '--offset', $args->{offset} if $args->{offset};
+                }
+                $result_text = run_fruitmail_cli(@cli_args) || "[]";
+            }
+            elsif ($func_name eq 'fruitmail_get_unread') {
+                my $lim = $args->{limit} // 10;
+                $result_text = run_fruitmail_cli('unread', '--limit', $lim) || "[]";
+            }
+            elsif ($func_name eq 'fruitmail_get_body') {
+                my $id = $args->{message_id};
+                $result_text = run_fruitmail_cli('body', $id) || "";
+            }
+            elsif ($func_name eq 'fruitmail_open_message') {
+                my $id = $args->{message_id};
+                $result_text = run_fruitmail_cli('open', $id) || "";
+            }
+            elsif ($func_name eq 'fruitmail_get_stats') {
+                $result_text = run_fruitmail_cli('stats') || "";
+            }
             else {
                 $result_text = "Error: Tool '$func_name' is not implemented.";
             }
@@ -423,7 +536,8 @@ post '/api/chat' => sub ($c) {
                {
                    role    => 'system',
                    content => "You are an intelligent email archivist and assistant for macOS Mail.app.\n"
-                            . "You have access to a suite of tools that run commands via mail-app-cli to query, view, archive, and send emails.\n\n"
+                            . "You have access to a suite of tools running commands via mail-app-cli and fruitmail-cli to query, view, archive, and send emails.\n\n"
+                            . "IMPORTANT: 'fruitmail' provides extremely fast, read-only SQLite search of local Apple Mail messages. It uses unique numeric database IDs (e.g., 604066). Always use fruitmail tools (fruitmail_search, fruitmail_get_unread, fruitmail_get_body) for high-speed local searching, checking unread messages, or viewing local message bodies when possible. Note that these IDs are different from mail-app-cli IDs.\n\n"
                             . "Always explain your actions clearly, format email lists nicely, and answer user queries with precise context obtained from your tools."
                }
            ]

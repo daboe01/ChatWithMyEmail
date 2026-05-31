@@ -7,6 +7,180 @@
 
 var BackendBaseURL = @"";
 
+// --- SUBCLASS: TABLE MATRIX VIEW ---
+@implementation TableMatrixView : CPView
+{
+    CPArray _headers;
+    CPArray _rows;
+    float   _rowHeight;
+}
+
+- (id)initWithHeaders:(CPArray)headers rows:(CPArray)rows width:(float)totalWidth
+{
+    self = [super initWithFrame:CGRectMake(0, 0, totalWidth, 20)];
+    if (self)
+    {
+        _headers = headers;
+        _rows = rows;
+        _rowHeight = 24.0; // Fixed row height for alignment
+        
+        var numCols = [headers count];
+
+        if (numCols == 0 && [rows count] > 0)
+            numCols = [[rows objectAtIndex:0] count];
+
+        // Instantiate cell views as placeholder frames
+        if ([headers count] > 0) {
+            for (var c = 0; c < numCols; c++) {
+                var headerText = [headers objectAtIndex:c];
+                var cellView = [self createCellWithText:headerText frame:CGRectMakeZero() isHeader:YES];
+                [self addSubview:cellView];
+            }
+        }
+        
+        for (var r = 0; r < [rows count]; r++) {
+            var rowData = [rows objectAtIndex:r];
+            for (var c = 0; c < numCols; c++) {
+                var cellText = @"";
+
+                if (c < [rowData count])
+                    cellText = [rowData objectAtIndex:c];
+
+                var cellView = [self createCellWithText:cellText frame:CGRectMakeZero() isHeader:NO];
+                [self addSubview:cellView];
+            }
+        }
+        
+        [self resizeToWidth:totalWidth];
+    }
+    return self;
+}
+
+- (CPView)createCellWithText:(CPString)text frame:(CGRect)frame isHeader:(BOOL)isHeader
+{
+    var cellContainer = [[CPView alloc] initWithFrame:frame];
+    [cellContainer setBackgroundColor:isHeader ? [CPColor colorWithWhite:0.92 alpha:1.0] : [CPColor whiteColor]];
+    
+    // Inner border simulation
+    var borderView = [[CPView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, frame.size.height)];
+    //[borderView setWantsLayer:YES];
+    //[[borderView layer] setBorderWidth:0.5];
+    //[[borderView layer] setBorderColor:[[CPColor colorWithWhite:0.8 alpha:1.0] CGColor]];
+    [cellContainer addSubview:borderView];
+    
+    // Aligned CPTextView cell
+    var textFrame = CGRectMake(4, 2, frame.size.width - 8, frame.size.height - 4);
+    var textView = [[CPTextView alloc] initWithFrame:textFrame];
+    [textView setEditable:NO];
+    [textView setSelectable:YES];
+    [textView setBackgroundColor:[CPColor clearColor]];
+    [textView setFont:isHeader ? [CPFont boldSystemFontOfSize:11.0] : [CPFont systemFontOfSize:11.0]];
+    [textView setString:text];
+    
+    [cellContainer addSubview:textView];
+    return cellContainer;
+}
+
+- (void)resizeToWidth:(float)newWidth
+{
+    var numCols = [_headers count];
+    if (numCols == 0 && [_rows count] > 0) {
+        numCols = [[_rows objectAtIndex:0] count];
+    }
+    if (numCols == 0) return;
+    
+    // Proportional column sizing based on maximum text length
+    var colMaxLengths = [];
+    for (var c = 0; c < numCols; c++) {
+        colMaxLengths[c] = 1;
+    }
+    for (var c = 0; c < numCols; c++) {
+        if (c < [_headers count]) {
+            colMaxLengths[c] = Math.max(colMaxLengths[c], [[_headers objectAtIndex:c] length]);
+        }
+    }
+    for (var r = 0; r < [_rows count]; r++) {
+        var rowData = [_rows objectAtIndex:r];
+        for (var c = 0; c < numCols; c++) {
+            if (c < [rowData count]) {
+                colMaxLengths[c] = Math.max(colMaxLengths[c], [[rowData objectAtIndex:c] length]);
+            }
+        }
+    }
+    
+    var totalLength = 0;
+    for (var c = 0; c < numCols; c++) {
+        totalLength += colMaxLengths[c];
+    }
+    
+    var colWidths = [];
+    var remainingWidth = newWidth;
+    for (var c = 0; c < numCols; c++) {
+        var w = Math.floor((colMaxLengths[c] / totalLength) * newWidth);
+        colWidths[c] = w;
+        remainingWidth -= w;
+    }
+    if (numCols > 0) {
+        colWidths[numCols - 1] += remainingWidth;
+    }
+    
+    var subviews = [self subviews];
+    var cellIndex = 0;
+    var currentY = 0;
+    
+    // Layout headers
+    if ([_headers count] > 0) {
+        var currentX = 0;
+        for (var c = 0; c < numCols; c++) {
+            if (cellIndex < [subviews count]) {
+                var cellView = [subviews objectAtIndex:cellIndex];
+                [cellView setFrame:CGRectMake(currentX, currentY, colWidths[c], _rowHeight)];
+                
+                var cellSubviews = [cellView subviews];
+                for (var s = 0; s < [cellSubviews count]; s++) {
+                    var cellSub = [cellSubviews objectAtIndex:s];
+                    if ([cellSub isKindOfClass:[CPTextView class]]) {
+                        [cellSub setFrame:CGRectMake(4, 2, colWidths[c] - 8, _rowHeight - 4)];
+                    } else {
+                        [cellSub setFrame:CGRectMake(0, 0, colWidths[c], _rowHeight)];
+                    }
+                }
+                cellIndex++;
+            }
+            currentX += colWidths[c];
+        }
+        currentY += _rowHeight;
+    }
+    
+    // Layout rows
+    for (var r = 0; r < [_rows count]; r++) {
+        var currentX = 0;
+        for (var c = 0; c < numCols; c++) {
+            if (cellIndex < [subviews count]) {
+                var cellView = [subviews objectAtIndex:cellIndex];
+                [cellView setFrame:CGRectMake(currentX, currentY, colWidths[c], _rowHeight)];
+                
+                var cellSubviews = [cellView subviews];
+                for (var s = 0; s < [cellSubviews count]; s++) {
+                    var cellSub = [cellSubviews objectAtIndex:s];
+                    if ([cellSub isKindOfClass:[CPTextView class]]) {
+                        [cellSub setFrame:CGRectMake(4, 2, colWidths[c] - 8, _rowHeight - 4)];
+                    } else {
+                        [cellSub setFrame:CGRectMake(0, 0, colWidths[c], _rowHeight)];
+                    }
+                }
+                cellIndex++;
+            }
+            currentX += colWidths[c];
+        }
+        currentY += _rowHeight;
+    }
+    
+    [self setFrameSize:CGSizeMake(newWidth, currentY)];
+}
+
+@end
+
 // --- HELPER CLASS: MARKDOWN -> CPATTRIBUTEDSTRING PARSER ---
 @implementation MarkdownParser : CPObject
 
@@ -19,8 +193,40 @@ var BackendBaseURL = @"";
     var result = [[CPMutableAttributedString alloc] initWithString:@""];
     var lines = markdown.split(/\r?\n/);
     
-    for (var i = 0; i < lines.length; i++) {
+    var i = 0;
+    while (i < lines.length) {
         var line = lines[i];
+        
+        // Match Markdown tables
+        if ([self isTableHeaderLine:line] && i + 1 < lines.length && [self isTableSeparatorLine:lines[i+1]]) {
+            var headers = [self parseTableCells:line];
+            var separatorLine = lines[i+1];
+            var rows = [CPMutableArray array];
+            
+            i += 2; // Skip headers and separators
+            while (i < lines.length && [self isTableRowLine:lines[i]]) {
+                [rows addObject:[self parseTableCells:lines[i]]];
+                i++;
+            }
+            
+            // Allocate layout lines representing table vertical layout space
+            var rowCount = [rows count] + (headers.length > 0 ? 1 : 0);
+            var tableHeight = rowCount * 24.0;
+            var lineCount = Math.ceil(tableHeight / 16.0); // Estimate needed empty carriage lines
+            var newlineStr = "";
+            for (var nl = 0; nl < lineCount; nl++) {
+                newlineStr += "\n";
+            }
+            
+            var tableAttrStr = [[CPMutableAttributedString alloc] initWithString:newlineStr];
+            var matrixView = [[TableMatrixView alloc] initWithHeaders:headers rows:rows width:500.0];
+            
+            // Insert custom attribute tracking the attachment view
+            [tableAttrStr addAttribute:@"TableAttachmentAttribute" value:matrixView range:CPMakeRange(0, [tableAttrStr length])];
+            [result appendAttributedString:tableAttrStr];
+            continue;
+        }
+        
         var isHeader = false;
         var headerLevel = 0;
         
@@ -47,9 +253,46 @@ var BackendBaseURL = @"";
         if (i < lines.length - 1) {
             [result appendAttributedString:[[CPAttributedString alloc] initWithString:@"\n"]];
         }
+        
+        i++;
     }
     
     return result;
+}
+
++ (BOOL)isTableHeaderLine:(CPString)line
+{
+    var trimmed = line.trim();
+    return trimmed.indexOf('|') !== -1;
+}
+
++ (BOOL)isTableSeparatorLine:(CPString)line
+{
+    var trimmed = line.trim();
+    if (trimmed.indexOf('|') === -1) return NO;
+    var stripped = trimmed.replace(/[\s|:\-]/g, '');
+    return stripped.length === 0;
+}
+
++ (BOOL)isTableRowLine:(CPString)line
+{
+    var trimmed = line.trim();
+    return trimmed.indexOf('|') !== -1;
+}
+
++ (CPArray)parseTableCells:(CPString)line
+{
+    var parts = line.split('|');
+    var cells = [CPMutableArray array];
+    var startIdx = 0;
+    var endIdx = parts.length;
+    if (parts[0].trim() === "") startIdx = 1;
+    if (parts[parts.length - 1].trim() === "") endIdx = parts.length - 1;
+    
+    for (var j = startIdx; j < endIdx; j++) {
+        [cells addObject:parts[j].trim()];
+    }
+    return cells;
 }
 
 + (CPAttributedString)parseInlineMarkdown:(CPString)text isHeader:(BOOL)isHeader headerLevel:(int)level
@@ -76,7 +319,6 @@ var BackendBaseURL = @"";
     }
     
     while (i < len) {
-        // Check for Bold-Italic (***)
         if (i + 2 < len && text.substr(i, 3) === "***") {
             if (currentSegment.length > 0) {
                 [result appendAttributedString:[self attributedStringWithText:currentSegment font:defaultFont bold:isBold italic:isItalic code:NO]];
@@ -87,7 +329,6 @@ var BackendBaseURL = @"";
             i += 3;
             continue;
         }
-        // Check for Bold (**)
         if (i + 1 < len && text.substr(i, 2) === "**") {
             if (currentSegment.length > 0) {
                 [result appendAttributedString:[self attributedStringWithText:currentSegment font:defaultFont bold:isBold italic:isItalic code:NO]];
@@ -97,7 +338,6 @@ var BackendBaseURL = @"";
             i += 2;
             continue;
         }
-        // Check for Italic (*)
         if (text.charAt(i) === "*") {
             if (currentSegment.length > 0) {
                 [result appendAttributedString:[self attributedStringWithText:currentSegment font:defaultFont bold:isBold italic:isItalic code:NO]];
@@ -107,7 +347,6 @@ var BackendBaseURL = @"";
             i++;
             continue;
         }
-        // Check for Monospace/Code (`)
         if (text.charAt(i) === "`") {
             if (currentSegment.length > 0) {
                 [result appendAttributedString:[self attributedStringWithText:currentSegment font:defaultFont bold:isBold italic:isItalic code:NO]];
@@ -1072,19 +1311,45 @@ var BackendBaseURL = @"";
     [textView setAutoresizingMask:CPViewWidthSizable];
     
     // Parse Markdown into CPAttributedString
+// Parse Markdown into CPAttributedString
     var parsedAttrStr = [MarkdownParser attributedStringFromMarkdown:cleanedText];
     
     // Setzen der Attributed String direkt im TextStorage
     [textView insertText:parsedAttrStr];
     
+    // --- LAYOUT TABLE ATTACHMENTS DYNAMICALLY ---
+    var length = [parsedAttrStr length];
+    var searchRange = CPMakeRange(0, 0);
+    var layoutManager = [textView layoutManager];
+    var textContainer = [textView textContainer];
+    
+    while (searchRange.location < length) {
+        var attrs = [parsedAttrStr attributesAtIndex:searchRange.location effectiveRange:searchRange];
+        var tableAttachment = [attrs objectForKey:@"TableAttachmentAttribute"];
+        if (tableAttachment) {
+            // Find rect representation where the whitespace buffer characters sit
+            var rect = [layoutManager boundingRectForGlyphRange:searchRange inTextContainer:textContainer];
+            var inset = [textView textContainerInset];
+            var totalWidth = docWidth - 30; // Match inner width of speech bubble textview
+            
+            rect.origin.x += inset.width;
+            rect.origin.y += inset.height;
+            rect.size.width = totalWidth;
+            
+            // Align cell layout to actual width on the screen
+            [tableAttachment resizeToWidth:totalWidth];
+            [tableAttachment setFrame:rect];
+            
+            [textView addSubview:tableAttachment];
+        }
+        searchRange.location = CPMaxRange(searchRange);
+    }
+    // --------------------------------------------
+    
     // Berechnung der präzisen Texthöhe mittels des integrierten CPLayoutManagers
-    var layoutManager = [textView layoutManager],
-        textContainer = [textView textContainer];
-        
-    [layoutManager glyphRangeForTextContainer:textContainer];
     var usedRect = [layoutManager usedRectForTextContainer:textContainer];
     var textHeight = CGRectGetHeight(usedRect);
-    
+
     if (textHeight < 20) {
         textHeight = 20;
     }
