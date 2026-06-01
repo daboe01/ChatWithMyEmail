@@ -21,7 +21,6 @@ Instead of relying on unstable filesystem caches or external binaries, MailArchi
 To run this application, you will need:
 
 * **PostgreSQL** (v12+) with the [pgvector](https://github.com/pgvector/pgvector) extension installed.
-* **macOS** with Mail.app configured (used by the JXA/AppleScript bridge when requesting to open physical emails on your screen).
 * **Perl 5.20+** with the following CPAN modules installed:
   ```bash
   cpanm Mojolicious Mojo::Pg Mail::IMAPClient Email::MIME DBI DBD::Pg Mojo::UserAgent
