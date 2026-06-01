@@ -1505,9 +1505,9 @@ var BackendBaseURL = @"";
     // TableMatrixViews innerhalb des Layouts platzieren
     var length = [parsedAttrStr length];
     var searchRange = CPMakeRange(0, 0);
-    var layoutManager = [_markdownRenderTextView layoutManager];
-    var textContainer = [_markdownRenderTextView textContainer];
-    var docWidth = CGRectGetWidth([_markdownRenderTextView bounds]);
+    var layoutManager = [textView layoutManager];
+    var textContainer = [textView textContainer];
+    var textViewWidth = CGRectGetWidth([textView bounds]);
 
     while (searchRange.location < length)
     {
@@ -1515,8 +1515,8 @@ var BackendBaseURL = @"";
         var tableAttachment = [attrs objectForKey:@"TableAttachmentAttribute"];
         if (tableAttachment) {
             var rect = [layoutManager boundingRectForGlyphRange:searchRange inTextContainer:textContainer];
-            var inset = [_markdownRenderTextView textContainerInset];
-            var totalWidth = docWidth - 40; 
+            var inset = [textView textContainerInset];
+            var totalWidth = textViewWidth - 40; 
             
             if (totalWidth < 100)
                 totalWidth = 100;
@@ -1528,7 +1528,7 @@ var BackendBaseURL = @"";
             [tableAttachment resizeToWidth:totalWidth];
             [tableAttachment setFrame:rect];
 
-            [_markdownRenderTextView addSubview:tableAttachment];
+            [textView addSubview:tableAttachment];
         }
         searchRange.location = CPMaxRange(searchRange);
     }
