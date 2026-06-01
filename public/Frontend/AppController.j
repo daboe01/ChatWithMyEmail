@@ -1,5 +1,5 @@
 // AppController.j
-// Cappuccino Frontend for LLMDataAnalyst2 - Email Archive Assistant
+// Cappuccino Frontend for Email Archive Assistant
 // (c) 2026 by Daniel Böhringer
 
 @import <AppKit/AppKit.j>
@@ -7,12 +7,11 @@
 
 var BackendBaseURL = @"";
 
-// --- SUBCLASS: TABLE MATRIX VIEW ---
+// --- SUBCLASS: TABLE MATRIX VIEW (DYNAMIC TEXT-VIEW ENGINE) ---
 @implementation TableMatrixView : CPView
 {
     CPArray _headers;
     CPArray _rows;
-    float   _rowHeight;
 }
 
 - (id)initWithHeaders:(CPArray)headers rows:(CPArray)rows width:(float)totalWidth
@@ -22,14 +21,19 @@ var BackendBaseURL = @"";
     {
         _headers = headers;
         _rows = rows;
-        _rowHeight = 24.0; // Fixed row height for alignment
         
         var numCols = [headers count];
 
         if (numCols == 0 && [rows count] > 0)
             numCols = [[rows objectAtIndex:0] count];
 
-        // Instantiate cell views as placeholder frames
+        // Äußerer oberer und linker Rand für die Tabelle selbst (Kollabierte Rahmen)
+        if (self._DOMElement) {
+            self._DOMElement.style.borderTop = "1px solid #e0e0e0";
+            self._DOMElement.style.borderLeft = "1px solid #e0e0e0";
+        }
+
+        // Zellen initial erstellen
         if ([headers count] > 0) {
             for (var c = 0; c < numCols; c++) {
                 var headerText = [headers objectAtIndex:c];
@@ -58,29 +62,65 @@ var BackendBaseURL = @"";
 
 - (CPView)createCellWithText:(CPString)text frame:(CGRect)frame isHeader:(BOOL)isHeader
 {
-    var cellContainer = [[CPView alloc] initWithFrame:frame];
+    // Verhindert den Zero-Width Bug bei der Initialisierung
+    var initialWidth = (frame.size.width > 0) ? frame.size.width : 120.0;
+    var initialHeight = (frame.size.height > 0) ? frame.size.height : 28.0;
+
+    var cellContainer = [[CPView alloc] initWithFrame:CGRectMake(frame.origin.x, frame.origin.y, initialWidth, initialHeight)];
     [cellContainer setBackgroundColor:isHeader ? [CPColor colorWithWhite:0.92 alpha:1.0] : [CPColor whiteColor]];
     
-    // Inner border simulation
-    var borderView = [[CPView alloc] initWithFrame:CGRectMake(0, 0, frame.size.width, frame.size.height)];
-    //[borderView setWantsLayer:YES];
-    //[[borderView layer] setBorderWidth:0.5];
-    //[[borderView layer] setBorderColor:[[CPColor colorWithWhite:0.8 alpha:1.0] CGColor]];
+    // Rahmen nur rechts und unten zeichnen (Vermeidet doppelte Linien im Raster)
+    var borderView = [[CPView alloc] initWithFrame:CGRectMake(0, 0, initialWidth, initialHeight)];
+    [borderView setBackgroundColor:[CPColor clearColor]];
+    [borderView setAutoresizingMask:CPViewWidthSizable | CPViewHeightSizable];
+    if (borderView._DOMElement) {
+        borderView._DOMElement.style.borderBottom = "1px solid #e0e0e0";
+        borderView._DOMElement.style.borderRight = "1px solid #e0e0e0";
+        borderView._DOMElement.style.boxSizing = "border-box";
+    }
     [cellContainer addSubview:borderView];
     
-    // Aligned CPTextView cell
-    var textFrame = CGRectMake(4, 2, frame.size.width - 8, frame.size.height - 4);
-    var textView = [[CPTextView alloc] initWithFrame:textFrame];
+    // CPTextView zur korrekten Rich-Text-Darstellung mit sicherem Start-Maß erstellen
+    var textContainer = [[CPTextContainer alloc] initWithContainerSize:CGSizeMake(initialWidth - 8, 1e7)];
+    var textView = [[CPTextView alloc] initWithFrame:CGRectMake(4, 2, initialWidth - 8, initialHeight - 4) textContainer:textContainer];
     [textView setEditable:NO];
     [textView setSelectable:YES];
     [textView setBackgroundColor:[CPColor clearColor]];
-    [textView setFont:isHeader ? [CPFont boldSystemFontOfSize:11.0] : [CPFont systemFontOfSize:11.0]];
-    [textView setString:text];
+    [textView setVerticallyResizable:YES];
+    [textView setHorizontallyResizable:NO];
+    [[textView textContainer] setWidthTracksTextView:YES];
+    
+    // Parsen von Inline-Elementen (z.B. **fett**) innerhalb von Tabellenzellen
+    var parsedText = [MarkdownParser parseInlineMarkdown:text isHeader:isHeader headerLevel:3];
+    
+    var storage = [textView textStorage];
+    if (storage && [storage respondsToSelector:@selector(setAttributedString:)]) {
+        [storage setAttributedString:parsedText];
+    } else {
+        [textView setEditable:YES];
+        [textView setString:@""];
+        [textView insertText:parsedText];
+        [textView setEditable:NO];
+    }
     
     [cellContainer addSubview:textView];
     return cellContainer;
 }
 
+// Hilfsfunktion: Sucht die CPTextView aus dem Zellen-Container heraus
+- (CPTextView)getTextViewFromCell:(CPView)cellView
+{
+    var subviews = [cellView subviews];
+    for (var i = 0; i < [subviews count]; i++) {
+        var sub = [subviews objectAtIndex:i];
+        if ([sub isKindOfClass:[CPTextView class]]) {
+            return sub;
+        }
+    }
+    return nil;
+}
+
+// Berechnet Spaltenbreiten und Zeilenhöhen auf Pixelbasis neu
 - (void)resizeToWidth:(float)newWidth
 {
     var numCols = [_headers count];
@@ -89,91 +129,182 @@ var BackendBaseURL = @"";
     }
     if (numCols == 0) return;
     
-    // Proportional column sizing based on maximum text length
-    var colMaxLengths = [];
+    var subviews = [self subviews];
+    
+    // 1. Spalten-Arrays initialisieren
+    var colNaturalWidths = []; // Ideale Breite ohne Zeilenumbruch
+    var colMinWidths = [];     // Minimale Breite, damit kein einzelnes Wort umbricht
     for (var c = 0; c < numCols; c++) {
-        colMaxLengths[c] = 1;
+        colNaturalWidths[c] = 80.0; 
+        colMinWidths[c] = 60.0;
     }
-    for (var c = 0; c < numCols; c++) {
-        if (c < [_headers count]) {
-            colMaxLengths[c] = Math.max(colMaxLengths[c], [[_headers objectAtIndex:c] length]);
+    
+    // Hilfs-TextField für Plaintext-Messungen
+    var measureTextField = [[CPTextField alloc] initWithFrame:CGRectMake(0, 0, 10000.0, 24.0)];
+    [measureTextField setFont:[CPFont systemFontOfSize:13.0]];
+    
+    // Hilfs-Block zur Ermittlung der minimalen Wort-Breiten und maximalen Natural-Breiten
+    var measureCell = function(cellText, isHeader, colIndex) {
+        var parsedText = [MarkdownParser parseInlineMarkdown:cellText isHeader:isHeader headerLevel:3];
+        [measureTextField setFont:isHeader ? [CPFont boldSystemFontOfSize:11.0] : [CPFont systemFontOfSize:11.0]];
+        
+        // A. Natural-Width messen (Vollständig unumbrochener Gesamttext)
+        [measureTextField setStringValue:[parsedText string]];
+        [measureTextField sizeToFit];
+        var naturalW = CGRectGetWidth([measureTextField frame]) + 24.0;
+        if (naturalW > colNaturalWidths[colIndex]) {
+            colNaturalWidths[colIndex] = naturalW;
         }
+        
+        // B. Absolute Min-Width messen (Das längste Einzelwort bestimmt das Limit)
+        var words = cellText.split(/[\s\-]/); // Trennung bei Whitespace oder Bindestrich
+        var maxWordW = 50.0;
+        for (var w = 0; w < words.length; w++) {
+            var word = words[w].trim();
+            if (word.length === 0) continue;
+            [measureTextField setStringValue:word];
+            [measureTextField sizeToFit];
+            var wordW = CGRectGetWidth([measureTextField frame]) + 30.0; // Margin + Padding
+            if (wordW > maxWordW) {
+                maxWordW = wordW;
+            }
+        }
+        if (maxWordW > colMinWidths[colIndex]) {
+            colMinWidths[colIndex] = maxWordW;
+        }
+    };
+    
+    // Header-Spalten vermessen
+    for (var c = 0; c < [_headers count]; c++) {
+        measureCell([_headers objectAtIndex:c], YES, c);
     }
+    
+    // Datenzellen vermessen
     for (var r = 0; r < [_rows count]; r++) {
         var rowData = [_rows objectAtIndex:r];
         for (var c = 0; c < numCols; c++) {
+            var cellText = @"";
             if (c < [rowData count]) {
-                colMaxLengths[c] = Math.max(colMaxLengths[c], [[rowData objectAtIndex:c] length]);
+                cellText = [rowData objectAtIndex:c];
             }
+            measureCell(cellText, NO, c);
         }
     }
     
-    var totalLength = 0;
+    // 2. Intelligente Breiten-Verteilung mit Min-Width-Constraint
+    var totalMinWidth = 0.0;
     for (var c = 0; c < numCols; c++) {
-        totalLength += colMaxLengths[c];
+        totalMinWidth += colMinWidths[c];
     }
     
     var colWidths = [];
-    var remainingWidth = newWidth;
-    for (var c = 0; c < numCols; c++) {
-        var w = Math.floor((colMaxLengths[c] / totalLength) * newWidth);
-        colWidths[c] = w;
-        remainingWidth -= w;
-    }
-    if (numCols > 0) {
-        colWidths[numCols - 1] += remainingWidth;
+    
+    if (newWidth <= totalMinWidth) {
+        // Fallback bei extrem engem Fenster
+        var remainingWidth = newWidth;
+        for (var c = 0; c < numCols; c++) {
+            var w = Math.floor((colMinWidths[c] / totalMinWidth) * newWidth);
+            colWidths[c] = w;
+            remainingWidth -= w;
+        }
+        if (numCols > 0) colWidths[numCols - 1] += remainingWidth;
+    } else {
+        // Normalfall: Jede Spalte erhält garantiert ihr Minimum. Der verbleibende Platz
+        // wird proportional anhand der noch benötigten Wachstumskapazität verteilt.
+        for (var c = 0; c < numCols; c++) {
+            colWidths[c] = colMinWidths[c];
+        }
+        
+        var totalGrowthCapacity = 0.0;
+        var growthCapacities = [];
+        for (var c = 0; c < numCols; c++) {
+            var capacity = Math.max(0.0, colNaturalWidths[c] - colMinWidths[c]);
+            growthCapacities[c] = capacity;
+            totalGrowthCapacity += capacity;
+        }
+        
+        var extraWidth = newWidth - totalMinWidth;
+        var remainingExtra = extraWidth;
+        
+        for (var c = 0; c < numCols; c++) {
+            if (totalGrowthCapacity > 0) {
+                var w = Math.floor((growthCapacities[c] / totalGrowthCapacity) * extraWidth);
+                colWidths[c] += w;
+                remainingExtra -= w;
+            }
+        }
+        if (numCols > 0) {
+            colWidths[numCols - 1] += remainingExtra;
+        }
     }
     
-    var subviews = [self subviews];
     var cellIndex = 0;
     var currentY = 0;
     
-    // Layout headers
-    if ([_headers count] > 0) {
-        var currentX = 0;
+    // Hilfsfunktion: Zeilenhöhe dynamisch über den LayoutManager messen
+    var layoutRow = function(startIndex) {
+        var maxCellHeight = 28.0; 
+        
+        // Erster Durchlauf: Breite zuweisen und exakte Höhe des umgebrochenen Texts berechnen
         for (var c = 0; c < numCols; c++) {
-            if (cellIndex < [subviews count]) {
-                var cellView = [subviews objectAtIndex:cellIndex];
-                [cellView setFrame:CGRectMake(currentX, currentY, colWidths[c], _rowHeight)];
-                
-                var cellSubviews = [cellView subviews];
-                for (var s = 0; s < [cellSubviews count]; s++) {
-                    var cellSub = [cellSubviews objectAtIndex:s];
-                    if ([cellSub isKindOfClass:[CPTextView class]]) {
-                        [cellSub setFrame:CGRectMake(4, 2, colWidths[c] - 8, _rowHeight - 4)];
-                    } else {
-                        [cellSub setFrame:CGRectMake(0, 0, colWidths[c], _rowHeight)];
+            var idx = startIndex + c;
+            if (idx < [subviews count]) {
+                var cellView = [subviews objectAtIndex:idx];
+                var textView = [self getTextViewFromCell:cellView];
+                if (textView) {
+                    var targetWidth = Math.max(10.0, colWidths[c] - 8);
+                    [[textView textContainer] setContainerSize:CGSizeMake(targetWidth, 1e7)];
+                    
+                    var usedRect = [[textView layoutManager] usedRectForTextContainer:[textView textContainer]];
+                    var wrappedHeight = CGRectGetHeight(usedRect) + 12.0; // Sicherheits-Padding
+                    if (wrappedHeight > maxCellHeight) {
+                        maxCellHeight = wrappedHeight;
                     }
                 }
-                cellIndex++;
+            }
+        }
+        
+        // Zweiter Durchlauf: Container platzieren und Textfelder einpassen
+        var currentX = 0;
+        for (var c = 0; c < numCols; c++) {
+            var idx = startIndex + c;
+            if (idx < [subviews count]) {
+                var cellView = [subviews objectAtIndex:idx];
+                [cellView setFrame:CGRectMake(currentX, currentY, colWidths[c], maxCellHeight)];
+                
+                var textView = [self getTextViewFromCell:cellView];
+                if (textView) {
+                    var targetWidth = Math.max(10.0, colWidths[c] - 8);
+                    
+                    var textY = 4.0;
+                    var finalTextViewHeight = maxCellHeight - 8.0;
+                    [textView setFrame:CGRectMake(4, textY, targetWidth, finalTextViewHeight)];
+                }
+                
+                // Border-View anpassen
+                var cellSubviews = [cellView subviews];
+                if ([cellSubviews count] > 0) {
+                    [[cellSubviews objectAtIndex:0] setFrame:CGRectMake(0, 0, colWidths[c], maxCellHeight)];
+                }
             }
             currentX += colWidths[c];
         }
-        currentY += _rowHeight;
+        
+        return maxCellHeight;
+    };
+    
+    // Header-Zeile berechnen
+    if ([_headers count] > 0) {
+        var headerHeight = layoutRow(cellIndex);
+        cellIndex += numCols;
+        currentY += headerHeight;
     }
     
-    // Layout rows
+    // Daten-Zeilen nacheinander berechnen
     for (var r = 0; r < [_rows count]; r++) {
-        var currentX = 0;
-        for (var c = 0; c < numCols; c++) {
-            if (cellIndex < [subviews count]) {
-                var cellView = [subviews objectAtIndex:cellIndex];
-                [cellView setFrame:CGRectMake(currentX, currentY, colWidths[c], _rowHeight)];
-                
-                var cellSubviews = [cellView subviews];
-                for (var s = 0; s < [cellSubviews count]; s++) {
-                    var cellSub = [cellSubviews objectAtIndex:s];
-                    if ([cellSub isKindOfClass:[CPTextView class]]) {
-                        [cellSub setFrame:CGRectMake(4, 2, colWidths[c] - 8, _rowHeight - 4)];
-                    } else {
-                        [cellSub setFrame:CGRectMake(0, 0, colWidths[c], _rowHeight)];
-                    }
-                }
-                cellIndex++;
-            }
-            currentX += colWidths[c];
-        }
-        currentY += _rowHeight;
+        var rowHeight = layoutRow(cellIndex);
+        cellIndex += numCols;
+        currentY += rowHeight;
     }
     
     [self setFrameSize:CGSizeMake(newWidth, currentY)];
@@ -181,7 +312,7 @@ var BackendBaseURL = @"";
 
 @end
 
-// --- HELPER CLASS: MARKDOWN -> CPATTRIBUTEDSTRING PARSER ---
+// --- MARKDOWN PARSER CLASS ---
 @implementation MarkdownParser : CPObject
 
 + (CPAttributedString)attributedStringFromMarkdown:(CPString)markdown
@@ -197,22 +328,85 @@ var BackendBaseURL = @"";
     while (i < lines.length) {
         var line = lines[i];
         
-        // Match Markdown tables
+        // Tabellen-Erkennung
         if ([self isTableHeaderLine:line] && i + 1 < lines.length && [self isTableSeparatorLine:lines[i+1]]) {
             var headers = [self parseTableCells:line];
             var separatorLine = lines[i+1];
             var rows = [CPMutableArray array];
             
-            i += 2; // Skip headers and separators
+            i += 2;
             while (i < lines.length && [self isTableRowLine:lines[i]]) {
                 [rows addObject:[self parseTableCells:lines[i]]];
                 i++;
             }
             
-            // Allocate layout lines representing table vertical layout space
-            var rowCount = [rows count] + (headers.length > 0 ? 1 : 0);
-            var tableHeight = rowCount * 24.0;
-            var lineCount = Math.ceil(tableHeight / 16.0); // Estimate needed empty carriage lines
+            var numCols = [headers count];
+            if (numCols == 0 && [rows count] > 0) {
+                numCols = [[rows objectAtIndex:0] count];
+            }
+            
+            // 1. Zuerst die absolute Summe der Natural-Breiten zur Spalten-Proportionsbestimmung ermitteln
+            var totalNaturalW = 0.0;
+            var colNaturalWidths = [];
+            var measureTextField = [[CPTextField alloc] initWithFrame:CGRectMake(0, 0, 10000.0, 24.0)];
+            [measureTextField setFont:[CPFont systemFontOfSize:11.0]];
+            
+            for (var c = 0; c < numCols; c++) {
+                var cellW = 80.0;
+                
+                // Headers prüfen
+                if (c < headers.length) {
+                    var parsedText = [self parseInlineMarkdown:headers[c] isHeader:YES headerLevel:3];
+                    [measureTextField setStringValue:[parsedText string]];
+                    [measureTextField sizeToFit];
+                    cellW = Math.max(cellW, CGRectGetWidth([measureTextField frame]) + 24.0);
+                }
+                
+                // Reihen prüfen
+                for (var r = 0; r < [rows count]; r++) {
+                    var rowData = [rows objectAtIndex:r];
+                    if (c < [rowData count]) {
+                        var parsedText = [self parseInlineMarkdown:rowData[c] isHeader:NO headerLevel:3];
+                        [measureTextField setStringValue:[parsedText string]];
+                        [measureTextField sizeToFit];
+                        cellW = Math.max(cellW, CGRectGetWidth([measureTextField frame]) + 24.0);
+                    }
+                }
+                colNaturalWidths[c] = cellW;
+                totalNaturalW += cellW;
+            }
+            
+            // 2. Präzise adaptive Zeilenhöhen-Schätzung für das Newline-Sizing (Verhindert zu große Abstände)
+            var estimatedHeight = 36.0; // Startwert für Header-Zeile mit Padding
+            for (var r = 0; r < [rows count]; r++) {
+                var rowData = [rows objectAtIndex:r];
+                var maxCellHeight = 28.0;
+                
+                for (var c = 0; c < numCols; c++) {
+                    var cellText = @"";
+                    if (c < [rowData count]) {
+                        cellText = [rowData objectAtIndex:c];
+                    }
+                    var charCount = cellText.length;
+                    
+                    // Schätzung basierend auf realistischer Spaltenbreitenverteilung
+                    var proportion = totalNaturalW > 0 ? (colNaturalWidths[c] / totalNaturalW) : (1.0 / numCols);
+                    var estimatedColWidth = proportion * 500.0;
+                    var charsPerLine = Math.max(10.0, Math.floor(estimatedColWidth / 6.5)); // ca. 6.5px pro Zeichen
+                    
+                    var estimatedLines = Math.ceil(charCount / charsPerLine);
+                    if (estimatedLines < 1) estimatedLines = 1;
+                    
+                    var cellHeight = (estimatedLines * 16.0) + 12.0;
+                    if (cellHeight > maxCellHeight) {
+                        maxCellHeight = cellHeight;
+                    }
+                }
+                estimatedHeight += maxCellHeight;
+            }
+            
+            // Berechne die benötigten Leerzeilen (\n Zeilenhöhe ist ca. 16px)
+            var lineCount = Math.ceil(estimatedHeight / 16.0) + 1; // Minimaler Sicherheitsabstand (+1)
             var newlineStr = "";
             for (var nl = 0; nl < lineCount; nl++) {
                 newlineStr += "\n";
@@ -221,7 +415,6 @@ var BackendBaseURL = @"";
             var tableAttrStr = [[CPMutableAttributedString alloc] initWithString:newlineStr];
             var matrixView = [[TableMatrixView alloc] initWithHeaders:headers rows:rows width:500.0];
             
-            // Insert custom attribute tracking the attachment view
             [tableAttrStr addAttribute:@"TableAttachmentAttribute" value:matrixView range:CPMakeRange(0, [tableAttrStr length])];
             [result appendAttributedString:tableAttrStr];
             continue;
@@ -230,7 +423,7 @@ var BackendBaseURL = @"";
         var isHeader = false;
         var headerLevel = 0;
         
-        // Match headers (# Header)
+        // Überschriften (#)
         var headerMatch = line.match(/^(#{1,6})\s+(.*)$/);
         if (headerMatch) {
             headerLevel = headerMatch[1].length;
@@ -238,7 +431,7 @@ var BackendBaseURL = @"";
             isHeader = true;
         }
         
-        // Match list items (- item)
+        // Listenpunkte (- oder *)
         var isListItem = false;
         var listMatch = line.match(/^(\*|-)\s+(.*)$/);
         if (listMatch) {
@@ -246,7 +439,6 @@ var BackendBaseURL = @"";
             isListItem = true;
         }
         
-        // Parse inline formatting
         var parsedLine = [self parseInlineMarkdown:line isHeader:isHeader headerLevel:headerLevel];
         [result appendAttributedString:parsedLine];
         
@@ -511,7 +703,7 @@ var BackendBaseURL = @"";
     CPTextField         _endpointField;
     CPTextField         _modelField;
     CPTextField         _apiKeyField;
-    CPTextField         _maxStepsField; // Neu deklariert für Max Steps
+    CPTextField         _maxStepsField;
 
     CPWindow            _historySheetWindow;
     CPTextView          _historySheetTextView;
@@ -539,7 +731,7 @@ var BackendBaseURL = @"";
         @"gemini-2.5-flash",
         @"",
         @"google/gemini-2.0-flash-001",
-        @"5" // Default Max Steps
+        @"5"
     ] forKeys:[
         @"LLMServiceType",
         @"LLMOllamaEndpoint",
@@ -570,14 +762,8 @@ var BackendBaseURL = @"";
     [appMenu addItemWithTitle:@"Settings..." action:@selector(openSettingsSheet:) keyEquivalent:@","];
     [mainMenu setSubmenu:appMenu forItem:appMenuItem];
 
-    // 2. Actions Menu
-    var actionsMenuItem = [mainMenu insertItemWithTitle:@"Actions" action:nil keyEquivalent:nil atIndex:1];
-    var actionsMenu = [[CPMenu alloc] initWithTitle:@"Actions"];
-    [actionsMenu addItemWithTitle:@"Refresh Mailboxes" action:@selector(fetchMailboxes:) keyEquivalent:@"r"];
-    [mainMenu setSubmenu:actionsMenu forItem:actionsMenuItem];
-
-    // 3. Edit Menu
-    var editMenuItem = [mainMenu insertItemWithTitle:@"Edit" action:nil keyEquivalent:nil atIndex:2];
+    // 2. Edit Menu
+    var editMenuItem = [mainMenu insertItemWithTitle:@"Edit" action:nil keyEquivalent:nil atIndex:1];
     var editMenu = [[CPMenu alloc] initWithTitle:@"Edit"];
     [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
@@ -610,7 +796,6 @@ var BackendBaseURL = @"";
     [leftContainer setAutoresizingMask:CPViewWidthSizable | CPViewHeightSizable];
     [leftContainer setBackgroundColor:[CPColor colorWithWhite:0.97 alpha:1.0]];
 
-    // ScrollView füllt fast den gesamten linken Container (außer den Footer für die Checkbox)
     _summaryScrollView = [[CPScrollView alloc] initWithFrame:CGRectMake(0, 0, leftWidth, splitHeight - 45)];
     [_summaryScrollView setAutoresizingMask:CPViewWidthSizable | CPViewHeightSizable];
     [_summaryScrollView setAutohidesScrollers:YES];
@@ -620,25 +805,26 @@ var BackendBaseURL = @"";
     [_summaryTableView setCornerView:nil];
     [_summaryTableView setDataSource:self];
 
-    var colAccount = [[CPTableColumn alloc] initWithIdentifier:@"account"];
-    [[colAccount headerView] setStringValue:@"Account"];
-    [colAccount setWidth:80];
-    [colAccount setMinWidth:40];
-    [_summaryTableView addTableColumn:colAccount];
-
+    // Column 1: Mailbox Folder
     var colMailbox = [[CPTableColumn alloc] initWithIdentifier:@"name"];
     [[colMailbox headerView] setStringValue:@"Mailbox"];
-    [colMailbox setWidth:110];
+    [colMailbox setWidth:leftWidth - 140];
     [colMailbox setMinWidth:50];
     [_summaryTableView addTableColumn:colMailbox];
 
+    // Column 2: Total Indexed Message Count
+    var colTotal = [[CPTableColumn alloc] initWithIdentifier:@"totalCount"];
+    [[colTotal headerView] setStringValue:@"Indexed"];
+    [colTotal setWidth:60];
+    [colTotal setMinWidth:40];
+    [_summaryTableView addTableColumn:colTotal];
+
+    // Column 3: Unread Count
     var colUnread = [[CPTableColumn alloc] initWithIdentifier:@"unreadCount"];
     [[colUnread headerView] setStringValue:@"Unread"];
-    [colUnread setWidth:leftWidth - 210];
+    [colUnread setWidth:60];
     [colUnread setMinWidth:40];
     [_summaryTableView addTableColumn:colUnread];
-
-    // Gesamtspalte (TotalCount) entfernt, da von Mail.app AppleScript nicht zuverlässig geliefert
 
     [_summaryScrollView setDocumentView:_summaryTableView];
     [leftContainer addSubview:_summaryScrollView];
@@ -747,19 +933,25 @@ var BackendBaseURL = @"";
         for (var i = 0; i < data.length; i++) {
             var box = data[i];
             
-            var accountName = box.Account || box.account || @"-";
             var mailboxName = box.Name || box.name || @"-";
+            
+            var totalVal = @"0";
+            if (box.TotalCount !== undefined) {
+                totalVal = box.TotalCount + @"";
+            } else if (box.total_count !== undefined) {
+                totalVal = box.total_count + @"";
+            }
             
             var unreadVal = @"0";
             if (box.UnreadCount !== undefined) {
                 unreadVal = box.UnreadCount + @"";
-            } else if (box.unreadCount !== undefined) {
-                unreadVal = box.unreadCount + @"";
+            } else if (box.unread_count !== undefined) {
+                unreadVal = box.unread_count + @"";
             }
-            
+           
             var rowDict = [CPDictionary dictionaryWithObjectsAndKeys:
-                accountName, @"account",
                 mailboxName, @"name",
+                totalVal, @"totalCount",
                 unreadVal, @"unreadCount"
             ];
             [_summaryRows addObject:rowDict];
@@ -809,7 +1001,6 @@ var BackendBaseURL = @"";
 {
     if (!_settingsWindow)
     {
-        // Höhe auf 300 erhöht, um Platz für das "Max Steps" Feld zu schaffen
         _settingsWindow = [[CPWindow alloc] initWithContentRect:CGRectMake(0, 0, 480, 300)
                                                       styleMask:CPTitledWindowMask | CPClosableWindowMask];
         
@@ -872,7 +1063,6 @@ var BackendBaseURL = @"";
         [_apiKeyField setFont:[CPFont systemFontOfSize:12.0]];
         [sheetContentView addSubview:_apiKeyField];
 
-        // NEUES ELEMENT: Max Steps Field
         var maxStepsLabel = [[CPTextField alloc] initWithFrame:CGRectMake(15, 185, 110, 20)];
         [maxStepsLabel setStringValue:@"Max Steps:"];
         [maxStepsLabel setFont:[CPFont systemFontOfSize:12.0]];
@@ -912,7 +1102,6 @@ var BackendBaseURL = @"";
 
     [self updateFieldsForService:activeService];
 
-    // Max Steps Wert setzen
     [_maxStepsField setStringValue:([defaults objectForKey:@"LLMMaxSteps"] || @"5") + @""];
 
     [CPApp beginSheet:_settingsWindow
@@ -986,7 +1175,6 @@ var BackendBaseURL = @"";
         [defaults setObject:[_apiKeyField stringValue] forKey:@"LLMOpenRouterAPIKey"];
     }
 
-    // Max Steps speichern
     var parsedSteps = parseInt([_maxStepsField stringValue]) || 5;
     [defaults setObject:parsedSteps forKey:@"LLMMaxSteps"];
 
@@ -1002,7 +1190,6 @@ var BackendBaseURL = @"";
     var config = [CPMutableDictionary dictionary];
     [config setObject:activeService forKey:@"service"];
     
-    // Max Steps zum Payload hinzufügen
     var maxSteps = [defaults objectForKey:@"LLMMaxSteps"] || 5;
     [config setObject:maxSteps forKey:@"max_steps"];
 
@@ -1041,13 +1228,13 @@ var BackendBaseURL = @"";
     [[_chatDocumentView subviews] makeObjectsPerformSelector:@selector(removeFromSuperview)];
     [_chatDocumentView setFrameSize:CGSizeMake(CGRectGetWidth([_chatScrollView bounds]) - 20, CGRectGetHeight([_chatScrollView bounds]))];
     
-    // Englische Kurzanleitung im Markdown-Format
+    // Aligned welcome text explaining actual capabilities
     var greetingText = @"### Welcome to MailArchivist!\n\n" +
                        "Here is a short **instruction guide** for your email assistant:\n\n" +
-                       "• **Mailbox Selection**: Select a mailbox in the left sidebar (e.g., `INBOX`).\n" +
-                       "• **Search & Query**: Ask questions about your emails (e.g., *“When did the latest email from Quora arrive?”*).\n" +
-                       "• **Precise Scope**: Activate **“Search selected mailbox only”** below the list to restrict the assistant's context.\n" +
-                       "• **Perform Actions**: Instruct the assistant to archive emails, mark them as read, or draft new responses.\n\n" +
+                       "• **Mailbox Browsing**: Browse database folders on the left side, showing total indexed and unread counts.\n" +
+                       "• **Keyword & Semantic Search**: Ask standard queries or describe concepts (e.g., *“Find discussions about server migrations”*), utilizing PostgreSQL vector embeddings.\n" +
+                       "• **Precise Scope**: Activate **“Search selected mailbox only”** below the list to restrict the assistant's perspective.\n" +
+                       "• **Direct Actions**: Instruct the assistant to **archive** messages or directly **open** physical emails natively inside macOS Mail.app.\n\n" +
                        "*How can I help you today?*";
 
     [self appendMessageWithSender:@"bot" text:greetingText isError:NO downloads:nil thumbnails:nil saveToHistory:YES];
@@ -1079,10 +1266,9 @@ var BackendBaseURL = @"";
     var mailboxFilter = null;
     if (selectedRow !== -1 && [_mailboxConstraintCheckbox state] == CPOnState) {
         var rowData = [_summaryRows objectAtIndex:selectedRow];
-        var accountName = [rowData objectForKey:@"account"];
         var mailboxName = [rowData objectForKey:@"name"];
-        mailboxFilter = { "account": accountName, "mailbox": mailboxName };
-        payloadPrompt = "[Constraint: Answer this question EXCLUSIVELY with emails from the account '" + accountName + "' and the mailbox '" + mailboxName + "'.] " + prompt;
+        mailboxFilter = { "mailbox": mailboxName };
+        payloadPrompt = "[Constraint: Answer this question EXCLUSIVELY with emails from the mailbox '" + mailboxName + "'.] " + prompt;
     }
 
     [chatInputField setStringValue:@""];
@@ -1311,42 +1497,43 @@ var BackendBaseURL = @"";
     [textView setAutoresizingMask:CPViewWidthSizable];
     
     // Parse Markdown into CPAttributedString
-// Parse Markdown into CPAttributedString
     var parsedAttrStr = [MarkdownParser attributedStringFromMarkdown:cleanedText];
     
     // Setzen der Attributed String direkt im TextStorage
     [textView insertText:parsedAttrStr];
     
-    // --- LAYOUT TABLE ATTACHMENTS DYNAMICALLY ---
+    // TableMatrixViews innerhalb des Layouts platzieren
     var length = [parsedAttrStr length];
     var searchRange = CPMakeRange(0, 0);
-    var layoutManager = [textView layoutManager];
-    var textContainer = [textView textContainer];
-    
-    while (searchRange.location < length) {
+    var layoutManager = [_markdownRenderTextView layoutManager];
+    var textContainer = [_markdownRenderTextView textContainer];
+    var docWidth = CGRectGetWidth([_markdownRenderTextView bounds]);
+
+    while (searchRange.location < length)
+    {
         var attrs = [parsedAttrStr attributesAtIndex:searchRange.location effectiveRange:searchRange];
         var tableAttachment = [attrs objectForKey:@"TableAttachmentAttribute"];
         if (tableAttachment) {
-            // Find rect representation where the whitespace buffer characters sit
             var rect = [layoutManager boundingRectForGlyphRange:searchRange inTextContainer:textContainer];
-            var inset = [textView textContainerInset];
-            var totalWidth = docWidth - 30; // Match inner width of speech bubble textview
+            var inset = [_markdownRenderTextView textContainerInset];
+            var totalWidth = docWidth - 40; 
             
+            if (totalWidth < 100)
+                totalWidth = 100;
+
             rect.origin.x += inset.width;
             rect.origin.y += inset.height;
             rect.size.width = totalWidth;
-            
-            // Align cell layout to actual width on the screen
+
             [tableAttachment resizeToWidth:totalWidth];
             [tableAttachment setFrame:rect];
-            
-            [textView addSubview:tableAttachment];
+
+            [_markdownRenderTextView addSubview:tableAttachment];
         }
         searchRange.location = CPMaxRange(searchRange);
     }
     // --------------------------------------------
     
-    // Berechnung der präzisen Texthöhe mittels des integrierten CPLayoutManagers
     var usedRect = [layoutManager usedRectForTextContainer:textContainer];
     var textHeight = CGRectGetHeight(usedRect);
 

@@ -1,16 +1,26 @@
 #!/usr/bin/env perl
-# LLMDataAnalyst2 - Email Archive Assistant Backend
+# Email Archive Assistant Backend (PostgreSQL & Vector Powered)
 use Mojolicious::Lite -signatures;
+use Mojo::Pg;
 use Mojo::UserAgent;
 use Mojo::JSON qw(decode_json encode_json);
 use File::Temp qw(tempdir);
 use File::Spec;
 use Encode;
+use Data::Dumper;
 
 no warnings 'uninitialized';
 
-my $ua = Mojo::UserAgent->new(request_timeout => 90, inactivity_timeout => 90);
+# ==========================================
+# CONFIGURATION & HELPERS
+# ==========================================
+helper pg => sub { state $pg = Mojo::Pg->new('postgresql://postgres@localhost/my_email') };
+
+my $ua = Mojo::UserAgent->new(request_timeout => 0, inactivity_timeout => 0);
 $ua->max_connections(0);
+
+my $OLLAMA_EMBED_URL = 'http://localhost:11434/api/embeddings';
+my $EMBED_MODEL      = 'mxbai-embed-large'; # Output size: 1024 dimensions
 
 my %SESSIONS;
 
@@ -29,33 +39,21 @@ app->hook(before_dispatch => sub ($c) {
 });
 
 # ==========================================
-# HELPER: Safe mail-app-cli Execution
+# HELPER: Generate Query Embedding
 # ==========================================
-sub run_mail_cli {
-    my (@args) = @_;
-    my $binary = "$ENV{HOME}/go/bin/mail-app-cli";
-    unless (-x $binary) {
-        $binary = "mail-app-cli"; # Fallback to PATH search
+helper get_query_embedding => sub ($c, $query_text) {
+    my $payload = {
+        model  => $EMBED_MODEL,
+        # Prefix required by mxbai-embed-large for searching document passages
+        prompt => "Represent this sentence for searching relevant passages: " . $query_text,
+    };
+    my $tx = $ua->post($OLLAMA_EMBED_URL => json => $payload);
+    if ($tx->result && $tx->result->is_success) {
+        my $res = decode_json($tx->result->body);
+        return '[' . join(',', @{$res->{embedding}}) . ']';
     }
-    # Safely escape shell arguments
-    my @escaped = map { my $s = $_; $s =~ s/'/'\\''/g; "'$s'" } @args;
-    my $cmd = "$binary " . join(" ", @escaped) . " 2>&1";
-    my $stdout = `$cmd`;
-    return $stdout;
-}
-
-# ==========================================
-# HELPER: Safe fruitmail Execution
-# ==========================================
-sub run_fruitmail_cli {
-    my (@args) = @_;
-    my $binary = "fruitmail"; # Assumes fruitmail is available in system PATH
-    # Safely escape shell arguments
-    my @escaped = map { my $s = $_; $s =~ s/'/'\\''/g; "'$s'" } @args;
-    my $cmd = "$binary " . join(" ", @escaped) . " 2>&1";
-    my $stdout = `$cmd`;
-    return $stdout;
-}
+    return undef;
+};
 
 # ==========================================
 # DEFINITION OF TOOLS (JSON SCHEMA)
@@ -65,7 +63,7 @@ my @available_tools = (
         type     => 'function',
         function => {
             name        => 'list_accounts_and_mailboxes',
-            description => 'Retrieves the list of configured email accounts and mailboxes.',
+            description => 'Retrieves the list of configured email folders stored in the database.',
             parameters  => { type => 'object', properties => {} }
         }
     },
@@ -73,12 +71,12 @@ my @available_tools = (
         type     => 'function',
         function => {
             name        => 'search_messages',
-            description => 'Searches for messages matching a query string across all mailboxes.',
+            description => 'Performs standard keyword and sender queries against indexed emails.',
             parameters  => {
                 type       => 'object',
                 properties => {
-                    query => { type => 'string', description => 'The search query or keyword.' },
-                    limit => { type => 'integer', description => 'Maximum results. Defaults to 10.' }
+                    query => { type => 'string', description => 'The keyword or sender name to search.' },
+                    limit => { type => 'integer', description => 'Maximum results (default: 10).' }
                 },
                 required => ['query']
             }
@@ -87,17 +85,31 @@ my @available_tools = (
     {
         type     => 'function',
         function => {
-            name        => 'list_messages',
-            description => 'Lists messages within a specific mailbox for an account. Supports optional unread filter.',
+            name        => 'semantic_search_messages',
+            description => 'Uses vector embeddings to find emails matching concepts or meanings even if exact keywords are missing.',
             parameters  => {
                 type       => 'object',
                 properties => {
-                    account => { type => 'string', description => 'The account name (e.g., "Gmail").' },
+                    concept => { type => 'string', description => 'The conceptual prompt or semantic meaning.' },
+                    limit   => { type => 'integer', description => 'Maximum results (default: 5).' }
+                },
+                required => ['concept']
+            }
+        }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'list_messages',
+            description => 'Lists messages within a specific mailbox folder.',
+            parameters  => {
+                type       => 'object',
+                properties => {
                     mailbox => { type => 'string', description => 'The mailbox folder (e.g., "INBOX").' },
-                    unread  => { type => 'boolean', description => 'If true, returns only unread messages.' },
+                    unread  => { type => 'boolean', description => 'Filter for only unread messages if true.' },
                     limit   => { type => 'integer', description => 'Maximum results. Defaults to 10.' }
                 },
-                required => ['account', 'mailbox']
+                required => ['mailbox']
             }
         }
     },
@@ -105,15 +117,13 @@ my @available_tools = (
         type     => 'function',
         function => {
             name        => 'show_message_details',
-            description => 'Retrieves the full details (sender, subject, body, headers) of a specific message ID.',
+            description => 'Retrieves the full structural content of an email using its database numeric ID.',
             parameters  => {
                 type       => 'object',
                 properties => {
-                    message_id => { type => 'string', description => 'The message ID.' },
-                    account    => { type => 'string', description => 'The account containing the message.' },
-                    mailbox    => { type => 'string', description => 'The mailbox containing the message.' }
+                    id => { type => 'integer', description => 'The unique database ID of the email.' }
                 },
-                required => ['message_id', 'account', 'mailbox']
+                required => ['id']
             }
         }
     },
@@ -121,100 +131,28 @@ my @available_tools = (
         type     => 'function',
         function => {
             name        => 'archive_message',
-            description => 'Archives a specific message.',
+            description => 'Sets the archived status flag of an email in the database to true.',
             parameters  => {
                 type       => 'object',
                 properties => {
-                    message_id => { type => 'string', description => 'The message ID.' },
-                    account    => { type => 'string', description => 'The account containing the message.' },
-                    mailbox    => { type => 'string', description => 'The mailbox containing the message.' }
+                    id => { type => 'integer', description => 'The database ID of the email.' }
                 },
-                required => ['message_id', 'account', 'mailbox']
+                required => ['id']
             }
         }
     },
     {
         type     => 'function',
         function => {
-            name        => 'send_email',
-            description => 'Sends a new email message.',
+            name        => 'open_message_in_macos_mail',
+            description => 'Launches macOS Mail.app and opens the selected email message in its native window.',
             parameters  => {
                 type       => 'object',
                 properties => {
-                    account => { type => 'string', description => 'The account to send from.' },
-                    to      => { type => 'string', description => 'Recipient email address.' },
-                    subject => { type => 'string', description => 'The subject line.' },
-                    body    => { type => 'string', description => 'The message body.' }
-                },
-                required => ['account', 'to', 'subject', 'body']
-            }
-        }
-    },
-    {
-        type     => 'function',
-        function => {
-            name        => 'fruitmail_search',
-            description => 'Fast local SQLite search on Apple Mail.app using fruitmail-cli. Returns a list of matching messages with database row IDs. Can filter by subject, sender, days limit, or unread status.',
-            parameters  => {
-                type       => 'object',
-                properties => {
-                    subject => { type => 'string', description => 'Filter by subject line.' },
-                    sender  => { type => 'string', description => 'Filter by sender address/name.' },
-                    days    => { type => 'integer', description => 'Limit search to emails from the last N days.' },
-                    unread  => { type => 'boolean', description => 'Filter for unread messages only.' },
-                    limit   => { type => 'integer', description => 'Maximum results (default: 10).' },
-                    offset  => { type => 'integer', description => 'Result offset for pagination.' }
-                }
-            }
-        }
-    },
-    {
-        type     => 'function',
-        function => {
-            name        => 'fruitmail_get_unread',
-            description => 'Quickly lists unread emails from local Apple Mail.app database using fruitmail-cli.',
-            parameters  => {
-                type       => 'object',
-                properties => {
-                    limit => { type => 'integer', description => 'Maximum results (default: 10).' }
-                }
-            }
-        }
-    },
-    {
-        type     => 'function',
-        function => {
-            name        => 'fruitmail_get_body',
-            description => 'Read the full email body of a specific local message ID via AppleScript through fruitmail-cli.',
-            parameters  => {
-                type       => 'object',
-                properties => {
-                    message_id => { type => 'string', description => 'The local database ID of the message (e.g., 604066).' }
+                    message_id => { type => 'string', description => 'The standard RFC822 Message-ID of the email.' }
                 },
                 required => ['message_id']
             }
-        }
-    },
-    {
-        type     => 'function',
-        function => {
-            name        => 'fruitmail_open_message',
-            description => 'Opens a specific email inside macOS Mail.app by its local fruitmail database ID.',
-            parameters  => {
-                type       => 'object',
-                properties => {
-                    message_id => { type => 'string', description => 'The local database ID of the message.' }
-                },
-                required => ['message_id']
-            }
-        }
-    },
-    {
-        type     => 'function',
-        function => {
-            name        => 'fruitmail_get_stats',
-            description => 'Retrieves SQLite database statistics for the local Apple Mail database via fruitmail.',
-            parameters  => { type => 'object', properties => {} }
         }
     }
 );
@@ -238,7 +176,7 @@ helper call_chat_llm => sub ($c, $messages, $tools, $config) {
        }
 
        my $payload = {
-           model    => $model || 'gemma4:e4b',
+           model    => $model || 'gemma2:9b-instruct-q8_0',
            messages => $messages,
            stream   => \0
        };
@@ -247,6 +185,7 @@ helper call_chat_llm => sub ($c, $messages, $tools, $config) {
        $ua->post($url => json => $payload => sub ($ua, $tx) {
            if ($tx->result && $tx->result->is_success) {
                my $res = eval { decode_json($tx->result->body) };
+               warn Dumper $res;
                my $msg = $res->{message} // { role => 'assistant', content => '' };
                $promise->resolve({
                    role       => 'assistant',
@@ -258,74 +197,9 @@ helper call_chat_llm => sub ($c, $messages, $tools, $config) {
                $promise->reject("Ollama Connection Error: " . $err_msg);
            }
        });
-
-   } elsif ($service eq 'groq' || $service eq 'openrouter') {
-       my $url = $service eq 'groq' 
-           ? 'https://api.groq.com/openai/v1/chat/completions'
-           : 'https://openrouter.ai/api/v1/chat/completions';
-
-       my $payload = {
-           model       => $model || ($service eq 'groq' ? 'llama3-8b-8192' : 'google/gemini-2.0-flash-001'),
-           messages    => $messages,
-           temperature => 0.1
-       };
-       $payload->{tools} = $tools if $tools && @$tools;
-
-       my $headers = {
-           'Authorization' => "Bearer $api_key",
-           'Content-Type'  => 'application/json'
-       };
-
-       $ua->post($url => $headers => json => $payload => sub ($ua, $tx) {
-           if ($tx->result && $tx->result->is_success) {
-               my $res = eval { decode_json($tx->result->body) };
-               my $choice = $res->{choices}[0]{message};
-               $promise->resolve({
-                   role       => 'assistant',
-                   content    => $choice->{content} // '',
-                   tool_calls => $choice->{tool_calls} // []
-               });
-           } else {
-               my $err_msg = $tx->error ? $tx->error->{message} : "Unknown Connection Error";
-               $promise->reject("Cloud API Error ($service): " . $err_msg);
-           }
-       });
-
-   } elsif ($service eq 'gemini') {
-       my $sel_model = $model || 'gemini-2.5-flash';
-       my $url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-
-       my $payload = {
-           model       => $sel_model,
-           messages    => $messages,
-           temperature => 0.1
-       };
-       $payload->{tools} = $tools if $tools && @$tools;
-
-       my $headers = {
-           'Authorization' => "Bearer $api_key",
-           'Content-Type'  => 'application/json'
-       };
-
-       $ua->post($url => $headers => json => $payload => sub ($ua, $tx) {
-           if ($tx->result && $tx->result->is_success) {
-               my $res = eval { decode_json($tx->result->body) };
-               my $choice = $res->{choices}[0]{message};
-               $promise->resolve({
-                   role       => 'assistant',
-                   content    => $choice->{content} // '',
-                   tool_calls => $choice->{tool_calls} // []
-               });
-           } else {
-               my $err_msg = $tx->error ? $tx->error->{message} : "Unknown Connection Error";
-               $promise->reject("Gemini API Error: " . $err_msg);
-           }
-       });
-
    } else {
        $promise->reject("Interface not supported: $service");
    }
-
    return $promise;
 };
 
@@ -386,78 +260,70 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 $args = eval { decode_json($args) } // {};
             }
 
-            my $result_text;
-            $c->app->log->info("[Agent] Executing Tool Call: $func_name");
+            my $result_text = "";
+            $c->app->log->info("[Agent DB] Executing DB Tool Call: $func_name");
 
             if ($func_name eq 'list_accounts_and_mailboxes') {
-                my $res_accts = run_mail_cli('accounts', 'list');
-                my $res_boxes = run_mail_cli('mailboxes', 'list');
-                $result_text = "Accounts:\n$res_accts\n\nMailboxes:\n$res_boxes";
+                my $boxes = $c->pg->db->query("SELECT DISTINCT mailbox FROM emails")->hashes;
+                $result_text = encode_json($boxes);
             }
             elsif ($func_name eq 'search_messages') {
-                my $q = $args->{query};
+                my $q = '%' . ($args->{query} // '') . '%';
                 my $lim = $args->{limit} // 10;
-                $result_text = run_mail_cli('search', $q, '--limit', $lim) || "[]";
+                my $res = $c->pg->db->query(
+                    "SELECT id, imap_uid, mailbox, subject, sender, date_sent, is_unread FROM emails " .
+                    "WHERE (subject ILIKE ? OR sender ILIKE ? OR body_text ILIKE ?) AND is_archived = FALSE " .
+                    "ORDER BY date_sent DESC LIMIT ?", $q, $q, $q, $lim
+                )->hashes;
+                $result_text = encode_json($res);
+            }
+            elsif ($func_name eq 'semantic_search_messages') {
+                my $concept = $args->{concept};
+                my $lim     = $args->{limit} // 15;
+                my $vec     = $c->get_query_embedding($concept);
+                warn $concept;
+                if ($vec) {
+                    my $res = $c->pg->db->query(q{
+                                                        SELECT e.id, e.subject, e.sender, e.date_sent,
+                                                               1 - (emb.embedding <=> ?::vector) AS similarity
+                                                        FROM email_embeddings emb
+                                                        JOIN emails e ON e.id = emb.idemail
+                                                        WHERE e.is_archived = FALSE
+                                                        ORDER BY similarity DESC LIMIT ?
+                                                    }, $vec, $lim)->hashes;
+                    $result_text = encode_json($res);
+                } else {
+                    $result_text = '{"error":"Failed to compute semantic query vector."}';
+                }
             }
             elsif ($func_name eq 'list_messages') {
-                my $acc = $args->{account};
                 my $box = $args->{mailbox};
-                my $lim = $args->{limit} // 10;
-                my @cli_args = ('messages', 'list', '-a', $acc, '-m', $box, '--limit', $lim);
-                push @cli_args, '--unread' if $args->{unread};
-                $result_text = run_mail_cli(@cli_args) || "[]";
+                my $lim = $args->{limit} // 50;
+                my $unread = $args->{unread} ? 1 : 0;
+                
+                my $sql = "SELECT id, imap_uid, subject, sender, date_sent, is_unread FROM emails WHERE mailbox = ? AND is_archived = FALSE";
+                $sql .= " AND is_unread = TRUE" if $unread;
+                $sql .= " ORDER BY date_sent DESC LIMIT ?";
+                
+                my $res = $c->pg->db->query($sql, $box, $lim)->hashes;
+                $result_text = encode_json($res);
             }
             elsif ($func_name eq 'show_message_details') {
-                my $id  = $args->{message_id};
-                my $acc = $args->{account};
-                my $box = $args->{mailbox};
-                $result_text = run_mail_cli('messages', 'show', $id, '-a', $acc, '-m', $box) || "{}";
+                my $id = $args->{id};
+                my $res = $c->pg->db->query("SELECT * FROM emails WHERE id = ?", $id)->hash;
+
+                if ($res) {
+                    # Bereinigt den E-Mail-Text vor der JSON-Kodierung für das LLM
+                    if ($res->{body_text} || $res->{raw_mime}) {
+                        $res->{body_text} = sanitize_email_text($res->{body_text} || $res->{raw_mime});
+                    }
+                }
+                $result_text = encode_json($res // {});
             }
             elsif ($func_name eq 'archive_message') {
-                my $id  = $args->{message_id};
-                my $acc = $args->{account};
-                my $box = $args->{mailbox};
-                $result_text = run_mail_cli('messages', 'archive', $id, '-a', $acc, '-m', $box) || '{"status":"archived"}';
-            }
-            elsif ($func_name eq 'send_email') {
-                my $acc  = $args->{account};
-                my $to   = $args->{to};
-                my $sub  = $args->{subject};
-                my $body = $args->{body};
-                $result_text = run_mail_cli('send', '-a', $acc, '-t', $to, '-s', $sub, '--body', $body) || '{"status":"sent"}';
-            }
-            # --- FRUITMAIL CLI TOOLS ---
-            elsif ($func_name eq 'fruitmail_search') {
-                my @cli_args = ();
-                # If only sender is provided, use dedicated sender action, otherwise build search
-                if ($args->{sender} && !$args->{subject} && !$args->{days} && !$args->{unread}) {
-                    @cli_args = ('sender', $args->{sender});
-                    push @cli_args, '--limit', $args->{limit} // 10;
-                } else {
-                    @cli_args = ('search');
-                    push @cli_args, '--subject', $args->{subject} if $args->{subject};
-                    push @cli_args, '--sender', $args->{sender} if $args->{sender};
-                    push @cli_args, '--days', $args->{days} if $args->{days};
-                    push @cli_args, '--unread' if $args->{unread};
-                    push @cli_args, '--limit', $args->{limit} // 10;
-                    push @cli_args, '--offset', $args->{offset} if $args->{offset};
-                }
-                $result_text = run_fruitmail_cli(@cli_args) || "[]";
-            }
-            elsif ($func_name eq 'fruitmail_get_unread') {
-                my $lim = $args->{limit} // 10;
-                $result_text = run_fruitmail_cli('unread', '--limit', $lim) || "[]";
-            }
-            elsif ($func_name eq 'fruitmail_get_body') {
-                my $id = $args->{message_id};
-                $result_text = run_fruitmail_cli('body', $id) || "";
-            }
-            elsif ($func_name eq 'fruitmail_open_message') {
-                my $id = $args->{message_id};
-                $result_text = run_fruitmail_cli('open', $id) || "";
-            }
-            elsif ($func_name eq 'fruitmail_get_stats') {
-                $result_text = run_fruitmail_cli('stats') || "";
+                my $id = $args->{id};
+                $c->pg->db->query("UPDATE emails SET is_archived = TRUE WHERE id = ?", $id);
+                $result_text = '{"status":"archived","id":' . $id . '}';
             }
             else {
                 $result_text = "Error: Tool '$func_name' is not implemented.";
@@ -486,38 +352,18 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
 # ROUTES
 # ==========================================
 
-# Fetches configured accounts & mailboxes dynamically for left panel view
+# Fetches mailboxes from database
 get '/api/mailboxes' => sub ($c) {
-    $c->app->log->info("[DEBUG Backend] Rufe 'mail-app-cli mailboxes list' auf...");
-
-    my $res_bytes = run_mail_cli('mailboxes', 'list');
-
-    # Rohe Bytes sauber als UTF-8 Zeichenkette decodieren für die Terminal-Protokollierung
-    my $res_chars = eval { Encode::decode_utf8($res_bytes) } // $res_bytes;
-
-    if (defined $res_chars) {
-        $c->app->log->debug("[DEBUG Backend] Roher CLI-Output (UTF-8 decodiert):\n" . $res_chars);
-    } else {
-        $c->app->log->error("[DEBUG Backend] CLI lieferte keinen Output.");
-    }
-
-    my $data = eval { decode_json($res_bytes) };
-    if ($@) {
-        my $err = $@;
-        $c->app->log->error("[DEBUG Backend] JSON-Parsing fehlgeschlagen: " . $err);
-        return $c->render(json => {
-            error      => "Ungültiges JSON vom Mail-CLI erhalten",
-            details    => $err,
-            raw_output => $res_chars // ''
-        }, status => 500);
-    }
-
-    if (ref $data eq 'ARRAY') {
-        my $count = scalar @$data;
-        $c->app->log->info("[DEBUG Backend] Erfolgreich $count Mailbox-Einträge geparst.");
-    }
-
-    $c->render(json => $data);
+    my $boxes = $c->pg->db->query(q{
+                                        SELECT mailbox AS name,
+                                        COUNT(*) AS total_count,
+                                        COUNT(*) FILTER (WHERE is_unread = TRUE) AS unread_count
+                                        FROM emails
+                                        GROUP BY mailbox
+                                        ORDER BY mailbox
+                                    })->hashes;
+    warn Dumper $boxes;
+    $c->render(json => $boxes);
 };
 
 post '/api/chat' => sub ($c) {
@@ -535,10 +381,10 @@ post '/api/chat' => sub ($c) {
            history => [
                {
                    role    => 'system',
-                   content => "You are an intelligent email archivist and assistant for macOS Mail.app.\n"
-                            . "You have access to a suite of tools running commands via mail-app-cli and fruitmail-cli to query, view, archive, and send emails.\n\n"
-                            . "IMPORTANT: 'fruitmail' provides extremely fast, read-only SQLite search of local Apple Mail messages. It uses unique numeric database IDs (e.g., 604066). Always use fruitmail tools (fruitmail_search, fruitmail_get_unread, fruitmail_get_body) for high-speed local searching, checking unread messages, or viewing local message bodies when possible. Note that these IDs are different from mail-app-cli IDs.\n\n"
-                            . "Always explain your actions clearly, format email lists nicely, and answer user queries with precise context obtained from your tools."
+                   content => "You are an intelligent email archivist and assistant managing a synchronized PostgreSQL database of emails.\n"
+                            . "You have tools to query keywords, scan folders, pull specific details, perform Semantic Search via vector embeddings, and even trigger macOS Mail.app to open physical emails.\n\n"
+                            . "Always select semantic_search_messages if the user query is conversational or conceptual, and standard search_messages for metadata/exact keyword queries.\n"
+                            . "Formulate highly structured, readable, and clean summaries of findings."
                }
            ]
        };
@@ -566,6 +412,191 @@ post '/api/chat' => sub ($c) {
        $c->render(json => {error => "Agentic workflow error", details => "$err"}, status => 500);
    });
 };
+
+use Mojo::DOM;
+
+# ==========================================
+# EMAIL SANITIZATION & MIME PARSING
+# ==========================================
+
+sub sanitize_email_text ($text) {
+    return $text if !$text;
+
+    # 1. Instantly intercept and strip raw binary content (images, PDFs, etc.)
+    if (is_binary_data($text)) {
+        return "[... BINARY ATTACHMENT STRIPPED ...]";
+    }
+
+    # 2. Parse raw MIME structures if present
+    if ($text =~ /^(?:Delivered-To|Received|From|To|Subject|MIME-Version|Content-Type|Return-Path):/mi) {
+        $text = parse_mime($text);
+    }
+
+    # 3. Clean up HTML inputs cleanly using Mojo::DOM
+    if ($text =~ /<html|<div|<p|<body|<head/i) {
+        $text = _strip_html($text);
+    }
+
+    # 4. Clean explicit MIME base64 transfer encoding blocks (safety fallback)
+    $text =~ s{Content-Transfer-Encoding:\s*base64\s*[\r\n]+([\s\S]+?)(?=--|\z)}{Content-Transfer-Encoding: base64\n\n[... BASE64 BINARY ATTACHMENT STRIPPED ...]\n}gi;
+
+    # 5. Clean generic massive contiguous blocks of base64-like lines (safety fallback)
+    $text =~ s{((?:[A-Za-z0-9+/\\=]{50,85}\r?\n){3,}[A-Za-z0-9+/\\=]{20,85}\r?\n?)}{[... BINARY DATA STRIPPED ...]\n}g;
+
+    # 6. Clean up formatting: Collapse excessive empty newlines into cleaner paragraphs
+    $text =~ s/\r//g;
+    $text =~ s/\n{3,}/\n\n/g;
+    $text =~ s/^\s+|\s+$//g;
+
+    warn $text;
+    return $text;
+}
+
+sub parse_mime ($text) {
+    my ($header_str, $body_str) = split(/\r?\n\r?\n/, $text, 2);
+    return $text unless defined $body_str;
+
+    # Parse headers (accounting for line-folding)
+    my %headers;
+    my $last_key;
+    for my $line (split /\r?\n/, $header_str) {
+        if ($line =~ /^([a-zA-Z0-9\-]+):\s*(.*)/) {
+            $last_key = lc $1;
+            $headers{$last_key} = $2;
+        } elsif ($line =~ /^\s+(.*)/ && $last_key) {
+            $headers{$last_key} .= " " . $1;
+        }
+    }
+
+    my $content_type = $headers{'content-type'} || 'text/plain';
+
+    # Stop early if this individual part is a non-text binary attachment
+    if ($content_type !~ /multipart/i && $content_type !~ /text\/(?:plain|html)/i) {
+        my ($filename) = $content_type =~ /name\s*=\s*["']?([^"';\s\r\n]+)["']?/i;
+        return $filename ? "[... BINARY ATTACHMENT: $filename STRIPPED ...]" : "[... BINARY ATTACHMENT STRIPPED ...]";
+    }
+
+    # If it is a multipart stream, locate boundaries and extract child components
+    if ($content_type =~ /multipart\/[a-z]+/i) {
+        my ($boundary) = $content_type =~ /boundary\s*=\s*["']?([^"';\s\r\n]+)["']?/i;
+        if ($boundary) {
+            my $q_boundary = quotemeta($boundary);
+            my @parts = split(/--$q_boundary/, $body_str);
+
+            shift @parts if @parts;
+            pop @parts if @parts && $parts[-1] =~ /^\s*--\s*$/;
+
+            my @text_parts;
+            my @html_parts;
+
+            for my $part (@parts) {
+                next if $part =~ /^\s*$/;
+                $part =~ s/^\r?\n//;
+
+                my ($part_header_str, $part_body_str) = split(/\r?\n\r?\n/, $part, 2);
+                $part_body_str //= '';
+
+                my %part_hdrs;
+                my $sub_last_key;
+                for my $line (split /\r?\n/, $part_header_str) {
+                    if ($line =~ /^([a-zA-Z0-9\-]+):\s*(.*)/) {
+                        $sub_last_key = lc $1;
+                        $part_hdrs{$sub_last_key} = $2;
+                    } elsif ($line =~ /^\s+(.*)/ && $sub_last_key) {
+                        $part_hdrs{$sub_last_key} .= " " . $1;
+                    }
+                }
+
+                my $part_type = $part_hdrs{'content-type'} || 'text/plain';
+
+                if ($part_type =~ /multipart/i) {
+                    my $parsed_nested = parse_mime($part);
+                    push @text_parts, { body => $parsed_nested } if $parsed_nested;
+                } elsif ($part_type =~ /text\/plain/i) {
+                    my $transfer_enc = lc($part_hdrs{'content-transfer-encoding'} || '');
+                    $transfer_enc =~ s/^\s+|\s+$//g;
+                    my $decoded_body = _decode_body($part_body_str, $transfer_enc, $part_type);
+                    push @text_parts, { body => $decoded_body };
+                } elsif ($part_type =~ /text\/html/i) {
+                    my $transfer_enc = lc($part_hdrs{'content-transfer-encoding'} || '');
+                    $transfer_enc =~ s/^\s+|\s+$//g;
+                    my $decoded_body = _decode_body($part_body_str, $transfer_enc, $part_type);
+                    push @html_parts, { body => $decoded_body };
+                }
+                # Other non-text types (like image/png) are skipped entirely in the multipart loop
+            }
+
+            if (@text_parts) {
+                return join("\n\n", map { $_->{body} } @text_parts);
+            } elsif (@html_parts) {
+                return join("\n\n", map { _strip_html($_->{body}) } @html_parts);
+            }
+            return "";
+        }
+    }
+
+    # Single-part processing fallback
+    my $transfer_enc = lc($headers{'content-transfer-encoding'} || '');
+    $transfer_enc =~ s/^\s+|\s+$//g;
+
+    my $decoded_body = _decode_body($body_str, $transfer_enc, $content_type);
+    if ($content_type =~ /text\/html/i) {
+        return _strip_html($decoded_body);
+    }
+    return $decoded_body;
+}
+
+sub _decode_body ($body, $transfer_enc, $content_type) {
+    if ($transfer_enc eq 'quoted-printable') {
+        require MIME::QuotedPrint;
+        $body = MIME::QuotedPrint::decode_qp($body);
+    } elsif ($transfer_enc eq 'base64') {
+        require MIME::Base64;
+        $body = MIME::Base64::decode_base64($body);
+    }
+
+    my ($charset) = $content_type =~ /charset\s*=\s*["']?([^"';\s\r\n]+)["']?/i;
+    if ($charset) {
+        $charset =~ s/^\s+|\s+$//g;
+        my $enc = Encode::find_encoding($charset);
+        if ($enc) {
+            eval { $body = $enc->decode($body) };
+        }
+    } else {
+        eval { $body = Encode::decode('UTF-8', $body) };
+    }
+
+    return $body;
+}
+
+sub _strip_html ($html) {
+    return '' unless defined $html && $html ne '';
+    my $dom = Mojo::DOM->new($html);
+    $dom->find('style, script, head, link, meta, title')->each(sub { $_->remove });
+
+    my $text = $dom->all_text;
+    $text =~ s/\r//g;
+    $text =~ s/\n{3,}/\n\n/g;
+    $text =~ s/^\s+|\s+$//g;
+    return $text;
+}
+
+sub is_binary_data ($text) {
+    # Check for well-known binary file signatures (magic bytes) at the very start
+    return 1 if $text =~ /^\x89PNG/s;
+    return 1 if $text =~ /^\xFF\xD8\xFF/s; # JPEG
+    return 1 if $text =~ /^%PDF/s;          # PDF
+    return 1 if $text =~ /^GIF8/s;          # GIF
+
+    # Quick, lightweight check: count control characters in the first 1000 bytes.
+    # Standard text contains whitespace like \t, \n, \r, and \f, but binary images
+    # will contain high densities of control characters (0x00 to 0x08, 0x0E to 0x1F)
+    my $sample = substr($text, 0, 1000);
+    my $control_count = $sample =~ tr/\x00-\x08\x0B\x0C\x0E-\x1F//;
+    return 1 if $control_count > 5;
+
+    return 0;
+}
 
 app->config(hypnotoad => {listen => ['http://*:3036'], workers => 1, heartbeat_timeout => 0, inactivity_timeout => 0});
 app->start;

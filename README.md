@@ -1,16 +1,16 @@
-# MailArchivist: Native Tool-Calling Chatbot for macOS Mail.app
+# MailArchivist: Database & Vector-Powered Email Assistant
 
-MailArchivist is an interactive, desktop-grade web client and backend coordinator that provides a conversational interface for your macOS Mail.app email archive. It leverages a native function-calling agentic loop to search, list, read, archive, and send emails directly through your configured Mail.app accounts.
+MailArchivist is an interactive, desktop-grade conversational email assistant. It combines structured database queries and semantic AI search to query, list, and interact with your email archive. 
 
-The project is built using a **Cappuccino (Objective-J)** frontend to deliver a desktop-like user interface and a lightweight **Mojolicious (Perl)** backend that maps LLM tool definitions directly to CLI commands.
+Instead of relying on unstable filesystem caches or external binaries, MailArchivist periodically synchronizes your IMAP mailboxes (specifically Gmail/Google Mail) into a **PostgreSQL** database. It generates high-dimensional vector embeddings of your clean email content using **Ollama** and stores them natively using the **`pgvector`** extension, enabling exact semantic search alongside classic keyword queries.
 
 ---
 
-## Architecture
+## New Architecture
 
-1. **Frontend (Cappuccino / Objective-J)**: A native-feeling single-page desktop-style app running in the browser. It displays your configured mailboxes in a sidebar table and features a fully-featured chat panel with session transfer capabilities.
-2. **Backend (Mojolicious / Perl)**: A local microservice that coordinates chat history, executes agentic function-calling cycles, and safely runs local commands via `mail-app-cli`.
-3. **CLI Layer (`mail-app-cli`)**: A Go-based command-line interface that controls macOS Mail.app natively using AppleScript and JavaScript for Automation (JXA).
+1. **Frontend (Cappuccino / Objective-J)**: A native-feeling single-page desktop-style app running in your browser. It displays your active synchronized mailboxes in a sidebar table and offers a rich chat interface with session save and restore support.
+2. **Backend (Mojolicious / Perl)**: A local microservice that manages the conversational agent loop. It uses `Mojo::Pg` to query the PostgreSQL database directly, matches context semantics using `pgvector` cosine similarity, and opens selected messages directly in macOS Mail.app via a native, zero-dependency AppleScript bridge.
+3. **Sync Engine (`sync_emails.pl`)**: A standalone, incremental Perl daemon that logs into your IMAP server, checks your database for the last synced folder UIDs, downloads new messages, strips signature blocks/repetitive forward boilerplate, fetches embeddings from Ollama, and inserts them cleanly into the database.
 
 ---
 
@@ -18,81 +18,86 @@ The project is built using a **Cappuccino (Objective-J)** frontend to deliver a 
 
 To run this application, you will need:
 
-* **macOS** with Mail.app configured with at least one active email account.
-* **Go 1.21+** (for compiling `mail-app-cli`).
+* **PostgreSQL** (v12+) with the [pgvector](https://github.com/pgvector/pgvector) extension installed.
+* **macOS** with Mail.app configured (used by the JXA/AppleScript bridge when requesting to open physical emails on your screen).
 * **Perl 5.20+** with the following CPAN modules installed:
-  * `Mojolicious`
-* **An LLM Provider**:
-  * **Ollama** (Running locally, e.g., with `gemma4:e4b` or another tool-capable model).
-  * Or API keys for **Groq**, **Google Gemini**, or **OpenRouter**.
+  ```bash
+  cpanm Mojolicious Mojo::Pg Mail::IMAPClient Email::MIME DBI DBD::Pg Mojo::UserAgent
+  ```
+* **Ollama** (Running locally) with:
+  * Your embedding model of choice: `bge-m3` (Default, 1024 dimensions).
+  * Your conversational tool-calling model: e.g., `gpt-oss:20b` works quite well on a MacBookPro M2/32GB system.
 
 ---
 
 ## Installation & Setup
 
-### 1. Install `mail-app-cli`
-Install the command-line helper from source using Go:
+### 1. Set Up the Database
+Create your database and run the schema setup script inside PostgreSQL to register the tables and the `hnsw` index:
 
 ```bash
-go install github.com/intelligrit/mail-app-cli@latest
+createdb my_email
+psql -d my_email -f setup.sql
 ```
 
-Ensure the compiled binary is available at `~/go/bin/mail-app-cli` (or is in your system's `PATH`). You can verify your installation by listing your configured Mail.app accounts:
+*(Note: If you are running an older version of `pgvector` (pre-0.5.0), remember to modify the index block in `setup.sql` to use `ivfflat` as instructed in your error logging steps.)*
+
+### 2. Configure and Run the Sync Engine
+Open your local copy of `sync_emails.pl` and set up your configurations:
+
+* Provide your IMAP server address (e.g., `imap.gmail.com`).
+* Set up your credentials. For Google Accounts, you **must** use a generated [Google App Password](https://support.google.com/accounts/answer/185833).
+* Configure your list of target mailboxes inside the `@MAILBOXES` array. (e.g., `'INBOX'`, `'[Google Mail]/Gesendet'`).
+
+Once configured, run your initial synchronization block:
 
 ```bash
-~/go/bin/mail-app-cli accounts list
+perl sync_emails.pl
 ```
 
-### 2. Set Up the Backend
-Clone this repository and ensure the Perl dependencies are installed. You can install Mojolicious via `cpanm`:
+*(You can run this script periodically via a cron job or keyboard macro to pull in your latest updates incrementally.)*
+
+### 3. Start the Backend
+Start the conversational Mojolicious assistant server:
 
 ```bash
-cpanm Mojolicious
+morbo ./backend.pl  --listen "http://*:3036"
 ```
 
-Run the Mojolicious backend server:
-
-```bash
-perl app.pl daemon -l http://localhost:3036
-```
-
-### 3. Open the Frontend
-Deploy the Cappuccino build folder on your local web server or open the development index file. If the backend is running on a different port or host than `http://localhost:3036`, you can configure the `BackendBaseURL` at the top of your `AppController.j`:
-
-```objc
-var BackendBaseURL = @"http://localhost:3036";
-```
+### 4. Deploy the Frontend
+Open http://localhost:3036/Frontend/index.html in your browser
 
 ---
 
-## Features
+## Key Features
 
-* **Visual Mailbox Overview**: On startup, the frontend requests your Mail.app directory structure and populates a left-hand sidebar containing accounts, mailbox names, and unread counters.
-* **Conversational Agent Loop**: The backend manages structured function-calling cycles (up to 5 recursive turns per prompt), allowing the LLM to search for a message, retrieve its details, make a decision, and execute further actions if necessary.
-* **Local and Cloud LLM Integration**: Change interface providers directly inside the app using the configuration modal. Supports local Ollama instances and cloud API endpoints (Groq, Gemini, and OpenRouter).
-* **Session Management**: Export and import entire chat histories using a unified JSON transfer panel. This lets you save conversations or resume them in a later session.
+* **Incremental IMAP Syncing**: Safely resumes syncing from the exact last saved UID per mailbox. Handled entirely via database updates to prevent duplicated message records.
+* **Boilerplate Reduction**: The sync script automatically strips standard signature dividers (`--`), email reply chains (`On date, user wrote:`), and forward blocks, ensuring your vector model is only embedding high-value conversational text.
+* **Hybrid Search (Keyword + Semantic)**:
+  * **Keyword Search**: Uses Postgres indexing for lightning-fast matching of sender names or subjects.
+  * **Semantic Vector Search**: Calculates query vectors dynamically and looks up context matches using HNSW-indexed cosine similarity.
+* **Native Desktop Window Integration**: When you ask the chatbot to open a message, the backend issues an in-process AppleScript command to tell Mail.app to locate and cleanly activate the target email on your macOS desktop.
 
 ---
 
 ## Supported Assistant Commands
 
-Your configured LLM can perform complex actions on your behalf by combining its tool schemas:
+The chatbot will select tools dynamically based on your request:
 
-* **Search**: *"Suchen Sie nach E-Mails von Daniel über das neue Budget."*
-* **List & Filter**: *"Zeige mir die letzten 5 ungelesenen E-Mails in meinem Posteingang."*
-* **Retrieve Details**: *"Was steht in der neuesten E-Mail von GitHub?"*
-* **Archive & Clean**: *"Archiviere bitte die Benachrichtigungs-E-Mail mit der ID xxxx."*
-* **Send Drafts**: *"Sende eine E-Mail an Daniel (daniel@example.com) mit dem Betreff 'Update' und dem Inhalt 'Ich habe das System aufgesetzt'."*
+* **Conceptual Search**: *"Who was talking about the server budget changes last month?"* (The agent will select `semantic_search_messages`).
+* **Metadata Filtering**: *"Show me the last 5 unread messages in [Google Mail]/Gesendet."* (The agent will select `list_messages` with unread constraints).
+* **Opening Mail**: *"Open the latest message about our cloud pricing."* (The agent will retrieve the ID and launch Mail.app to focus it).
+* **Archive**: *"Archive the subscription receipt from yesterday."*
 
 ---
 
 ## Configuration
 
-Click on the **"Einstellungen..."** (Settings) button in the upper menu bar of the frontend to configure your LLM:
+Click on the **"Einstellungen..."** (Settings) menu bar inside the frontend interface to adjust your system configuration:
 
-* **Schnittstelle (Interface)**: Choose between Ollama, Groq, Gemini, or OpenRouter.
-* **Modellname (Model name)**: Specify the model (e.g., `gemma4:e4b` or `google/gemini-2.0-flash-001`).
-* **API-Schlüssel (API Key)**: Provide your provider authentication token when using cloud models.
+* **Interface (Schnittstelle)**: Choose between Ollama (Local), Groq, Gemini, or OpenRouter.
+* **Model Name (Modellname)**: Define your chat model (e.g., `gemma2:9b-instruct-q8_0`).
+* **Max Steps**: Set the recursion limit for the agent loop (default: `5`). This protects you from infinite search loops if the model gets stuck.
 
 ---
 
