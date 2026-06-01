@@ -154,6 +154,20 @@ my @available_tools = (
                 required => ['message_id']
             }
         }
+    },
+    {
+        type     => 'function',
+        function => {
+            name        => 'web_lookup',
+            description => 'Performs an HTTP GET request to fetch and read text or HTML content from a web URL.',
+            parameters  => {
+                type       => 'object',
+                properties => {
+                    url => { type => 'string', description => 'The absolute HTTP or HTTPS URL to fetch.' }
+                },
+                required => ['url']
+            }
+        }
     }
 );
 
@@ -261,7 +275,7 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
             }
 
             my $result_text = "";
-            $c->app->log->info("[Agent DB] Executing DB Tool Call: $func_name");
+            $c->app->log->info("[Agent DB] Executing Tool Call: $func_name");
 
             if ($func_name eq 'list_accounts_and_mailboxes') {
                 my $boxes = $c->pg->db->query("SELECT DISTINCT mailbox FROM emails")->hashes;
@@ -325,6 +339,43 @@ sub run_agent_tool_loop ($c, $messages, $session, $llm_config, $step) {
                 $c->pg->db->query("UPDATE emails SET is_archived = TRUE WHERE id = ?", $id);
                 $result_text = '{"status":"archived","id":' . $id . '}';
             }
+            elsif ($func_name eq 'web_lookup') {
+                my $url = $args->{url};
+                if ($url =~ m{^https?://}i) {
+                    my $tx = $ua->get($url);
+                    if ($tx->result && $tx->result->is_success) {
+                        my $body = $tx->result->body;
+                        my $content_type = $tx->result->headers->content_type // '';
+                        
+                        # Fallback: HTML-Inhalte für das LLM bereinigen
+                        if ($content_type =~ /html/i) {
+                            $body = _strip_html($body);
+                        }
+                        
+                        # Text kürzen, um das Kontextfenster des Modells nicht zu überladen
+                        if (length($body) > 12000) {
+                            $body = substr($body, 0, 12000) . "\n\n[... TRUNCATED DUE TO SIZE LIMIT ...]";
+                        }
+                        
+                        $result_text = encode_json({
+                            status  => 'success',
+                            url     => $url,
+                            content => $body
+                        });
+                    } else {
+                        my $err_msg = $tx->error ? $tx->error->{message} : "Unknown Connection Error";
+                        $result_text = encode_json({
+                            status => 'error',
+                            error  => "Failed to retrieve URL. $err_msg"
+                        });
+                    }
+                } else {
+                    $result_text = encode_json({
+                        status => 'error',
+                        error  => "Invalid URL protocol. Only HTTP and HTTPS are supported."
+                    });
+                }
+            }
             else {
                 $result_text = "Error: Tool '$func_name' is not implemented.";
             }
@@ -382,7 +433,7 @@ post '/api/chat' => sub ($c) {
                {
                    role    => 'system',
                    content => "You are an intelligent email archivist and assistant managing a synchronized PostgreSQL database of emails.\n"
-                            . "You have tools to query keywords, scan folders, pull specific details, perform Semantic Search via vector embeddings, and even trigger macOS Mail.app to open physical emails.\n\n"
+                            . "You have tools to query keywords, scan folders, pull specific details, perform Semantic Search via vector embeddings, look up web pages, and even trigger macOS Mail.app to open physical emails.\n\n"
                             . "Always select semantic_search_messages if the user query is conversational or conceptual, and standard search_messages for metadata/exact keyword queries.\n"
                             . "Formulate highly structured, readable, and clean summaries of findings."
                }
