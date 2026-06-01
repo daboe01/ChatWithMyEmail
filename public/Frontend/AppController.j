@@ -1333,6 +1333,7 @@ var BackendBaseURL = @"";
             var cpThumbnails = data.thumbnails ? [CPArray arrayWithArray:data.thumbnails] : nil;
             [selfRef appendMessageWithSender:@"bot" text:msg isError:NO downloads:cpDownloads thumbnails:cpThumbnails saveToHistory:YES];
         }
+        [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode];
     })
     .catch(function(error) {
         [progressBar stopAnimation:selfRef];
