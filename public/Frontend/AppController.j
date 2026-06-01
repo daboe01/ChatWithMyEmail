@@ -1333,7 +1333,7 @@ var BackendBaseURL = @"";
             var cpThumbnails = data.thumbnails ? [CPArray arrayWithArray:data.thumbnails] : nil;
             [selfRef appendMessageWithSender:@"bot" text:msg isError:NO downloads:cpDownloads thumbnails:cpThumbnails saveToHistory:YES];
         }
-        [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode];
+        [[CPRunLoop currentRunLoop] limitDateForMode:CPDefaultRunLoopMode]; // pump run loop to force GUI update
     })
     .catch(function(error) {
         [progressBar stopAnimation:selfRef];
