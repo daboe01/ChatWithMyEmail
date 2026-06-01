@@ -68,27 +68,13 @@ morbo ./backend.pl  --listen "http://*:3036"
 ### 4. Deploy the Frontend
 Open http://localhost:3036/Frontend/index.html in your browser
 
----
-
-## Key Features
-
-* **Incremental IMAP Syncing**: Safely resumes syncing from the exact last saved UID per mailbox. Handled entirely via database updates to prevent duplicated message records.
-* **Boilerplate Reduction**: The sync script automatically strips standard signature dividers (`--`), email reply chains (`On date, user wrote:`), and forward blocks, ensuring your vector model is only embedding high-value conversational text.
-* **Hybrid Search (Keyword + Semantic)**:
-  * **Keyword Search**: Uses Postgres indexing for lightning-fast matching of sender names or subjects.
-  * **Semantic Vector Search**: Calculates query vectors dynamically and looks up context matches using HNSW-indexed cosine similarity.
-* **Native Desktop Window Integration**: When you ask the chatbot to open a message, the backend issues an in-process AppleScript command to tell Mail.app to locate and cleanly activate the target email on your macOS desktop.
-
----
-
 ## Supported Assistant Commands
 
 The chatbot will select tools dynamically based on your request:
 
 * **Conceptual Search**: *"Who was talking about the server budget changes last month?"* (The agent will select `semantic_search_messages`).
 * **Metadata Filtering**: *"Show me the last 5 unread messages in [Google Mail]/Gesendet."* (The agent will select `list_messages` with unread constraints).
-* **Opening Mail**: *"Open the latest message about our cloud pricing."* (The agent will retrieve the ID and launch Mail.app to focus it).
-* **Archive**: *"Archive the subscription receipt from yesterday."*
+* **Web lookup**: *"Lookup the URL from the internet."*
 
 ---
 
@@ -97,7 +83,7 @@ The chatbot will select tools dynamically based on your request:
 Click on the **"Einstellungen..."** (Settings) menu bar inside the frontend interface to adjust your system configuration:
 
 * **Interface (Schnittstelle)**: Choose between Ollama (Local), Groq, Gemini, or OpenRouter.
-* **Model Name (Modellname)**: Define your chat model (e.g., `gemma2:9b-instruct-q8_0`).
+* **Model Name (Modellname)**: Define your chat model (e.g., `gpt-oss:20b`).
 * **Max Steps**: Set the recursion limit for the agent loop (default: `5`). This protects you from infinite search loops if the model gets stuck.
 
 ---
