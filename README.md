@@ -4,6 +4,8 @@ MailArchivist is an interactive, desktop-grade conversational email assistant. I
 
 Instead of relying on unstable filesystem caches or external binaries, MailArchivist periodically synchronizes your IMAP mailboxes (specifically Gmail/Google Mail) into a **PostgreSQL** database. It generates high-dimensional vector embeddings of your clean email content using **Ollama** and stores them natively using the **`pgvector`** extension, enabling exact semantic search alongside classic keyword queries.
 
+<img width="1353" height="601" alt="Bildschirmfoto 2026-06-01 um 12 15 18" src="https://github.com/user-attachments/assets/d311600c-fbaa-490a-bcb7-eb014dd37c16" />
+
 ---
 
 ## New Architecture
