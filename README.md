@@ -11,7 +11,7 @@ Instead of relying on unstable filesystem caches or external binaries, MailArchi
 ## New Architecture
 
 1. **Frontend (Cappuccino / Objective-J)**: A native-feeling single-page desktop-style app running in your browser. It displays your active synchronized mailboxes in a sidebar table and offers a rich chat interface with session save and restore support.
-2. **Backend (Mojolicious / Perl)**: A local microservice that manages the conversational agent loop. It uses `Mojo::Pg` to query the PostgreSQL database directly, matches context semantics using `pgvector` cosine similarity, and opens selected messages directly in macOS Mail.app via a native, zero-dependency AppleScript bridge.
+2. **Backend (Mojolicious / Perl)**: A local microservice that manages the conversational agent loop. It uses `Mojo::Pg` to query the PostgreSQL database directly, matches context semantics using `pgvector` cosine similarity, and can even access URLs from the retrieved Emails if neccessary.
 3. **Sync Engine (`sync_emails.pl`)**: A standalone, incremental Perl daemon that logs into your IMAP server, checks your database for the last synced folder UIDs, downloads new messages, strips signature blocks/repetitive forward boilerplate, fetches embeddings from Ollama, and inserts them cleanly into the database.
 
 ---
