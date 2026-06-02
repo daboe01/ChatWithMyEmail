@@ -7,7 +7,7 @@ use Mojo::UserAgent;
 use Mojo::JSON qw(encode_json decode_json);
 use Digest::MD5 qw(md5_hex);
 use POSIX qw(strftime);
-use IPC::Open2;
+use File::Temp qw(tempfile);
 
 # Ensure standard output uses UTF-8 encoding
 binmode(STDOUT, ":utf8");
@@ -101,12 +101,18 @@ foreach my $line (@list_output) {
         $subject =~ s/^#+\s*//;
         $subject =~ s/\s+$//;
 
-        # Clean RTF/HTML/Markdown structure and binary chunks
+        # Clean formatting structure and binary chunks
         my $cleaned_body = clean_note_body($content);
         my $current_time = strftime("%Y-%m-%d %H:%M:%S", localtime);
         my $message_id   = "apple-note-" . md5_hex($subject) . "\@local";
 
-        # Build clean structural context block for vector embedding
+        # Truncate extensively long content specifically for the embedding payload
+        # This keeps representation dense and safe for Ollama's context limits
+        my $truncated_body = length($cleaned_body) > 1200 
+            ? substr($cleaned_body, 0, 1200) . " ... [TRUNCATED]" 
+            : $cleaned_body;
+
+        # Build structural context block for vector embedding
         my $text_to_embed = sprintf(
             "Email Folder: %s\n" .
             "From: %s\n" .
@@ -119,7 +125,7 @@ foreach my $line (@list_output) {
             $ENV{USER} // 'Local User',
             $current_time,
             $subject,
-            substr($cleaned_body, 0, 1200)
+            $truncated_body
         );
 
         my $embedding_vector = get_embedding($text_to_embed);
@@ -138,7 +144,7 @@ foreach my $line (@list_output) {
                 $ENV{USER} // 'Local User',
                 $current_time,
                 0,
-                $cleaned_body,             # Store the fully sanitized plain text body
+                $cleaned_body,             # Store the full, plain text body in the DB
                 undef,                     # body_html
                 undef                      # raw_mime
             );
@@ -185,12 +191,15 @@ sub clean_note_body {
     # 1. Strip memo's custom image placeholder tokens
     $body =~ s/\[MEMO_IMG_\d+\]//g;
 
-    # 2. Strip binary blocks (unbroken Base64 / raw hex lists common in embeds)
-    $body =~ s/\b[A-Za-z0-9\+\/=]{80,}\b//g;
-    $body =~ s/\b[a-fA-F0-9]{80,}\b//g;
+    # 2. Strip long unbroken base64/hex sequences safely using fixed-width lookarounds
+    $body =~ s/(?<![A-Za-z0-9])[A-Za-z0-9\+\/=]{80,}(?![A-Za-z0-9])//g;
+    $body =~ s/(?<![a-fA-F0-9])[a-fA-F0-9]{80,}(?![a-fA-F0-9])//g;
 
-    # 3. Use Pandoc to cleanly parse away RTF control codes or styling artifacts
-    $body = clean_with_pandoc($body);
+    # 3. Only run Pandoc if we detect clear signs of rich text (RTF, HTML, complex Markdown).
+    # Otherwise, skip to prevent parser warnings, errors, or overhead.
+    if (has_rich_text($body)) {
+        $body = clean_with_pandoc($body);
+    }
 
     # 4. Standard spacing cleanups
     $body =~ s/[ \t]+/ /g;
@@ -199,6 +208,26 @@ sub clean_note_body {
     $body =~ s/^\s+|\s+$//g;
 
     return $body;
+}
+
+sub has_rich_text {
+    my ($text) = @_;
+    return 0 unless defined $text;
+
+    # Clear signs of RTF markup
+    return 1 if $text =~ /^\s*\{\\rtf/s;
+
+    # Clear signs of HTML markup
+    return 1 if $text =~ /<html/si || $text =~ /<!DOCTYPE/si || $text =~ /<\/?[a-z][a-z0-9]*\b[^>]*>/si;
+
+    # Clear signs of standard Markdown structures
+    return 1 if $text =~ /^\s*#+\s+/m;              # Headers
+    return 1 if $text =~ /\[[^\]]+\]\([^)]+\)/;     # Inline links
+    return 1 if $text =~ /^[*-]\s+\S+/m;            # Unordered lists
+    return 1 if $text =~ /^\d+\.\s+\S+/m;           # Numbered lists
+    return 1 if $text =~ /\|[^|]+\|/;                # Tables
+
+    return 0;
 }
 
 sub clean_with_pandoc {
@@ -213,32 +242,32 @@ sub clean_with_pandoc {
         $from_format = 'html';
     }
 
-    # Use bidirectional pipes via IPC::Open2
-    my ($ch_out, $ch_in);
-    my $pid;
-    
+    # Use standard File::Temp to write safely to disk and avoid pipe deadlock
+    my ($fh, $filename);
     eval {
-        $pid = open2($ch_out, $ch_in, 'pandoc', '-f', $from_format, '-t', 'plain', '--wrap=none');
+        ($fh, $filename) = tempfile(UNLINK => 1);
     };
     if ($@) {
-        warn "Pandoc is not accessible or not installed. Falling back to simple regex cleanup.\n";
+        warn "Could not create temporary file: $@. Falling back to regex cleanup.\n";
         return clean_fallback_regex($content);
     }
 
-    # Send note content to Pandoc input buffer
-    binmode($ch_in, ":utf8");
-    print $ch_in $content;
-    close $ch_in;
+    binmode($fh, ":utf8");
+    print $fh $content;
+    close $fh;
 
-    # Collect rendered plain text from Pandoc output buffer
-    binmode($ch_out, ":utf8");
-    my $cleaned = do { local $/; <$ch_out> };
-    close $ch_out;
+    # Run pandoc, reading directly from file to pull clean plain text safely
+    my $cleaned = '';
+    eval {
+        open(my $pandoc_out, "-|", "pandoc", "-f", $from_format, "-t", "plain", "--wrap=none", $filename)
+            or die "Cannot open pandoc: $!";
+        binmode($pandoc_out, ":utf8");
+        $cleaned = do { local $/; <$pandoc_out> };
+        close $pandoc_out;
+    };
 
-    waitpid($pid, 0);
-
-    # Fall back if Pandoc encountered an execution error or empty buffer
-    if ($? != 0 || !defined $cleaned || $cleaned eq '') {
+    # Fallback checks if execution fails or pathing is missing
+    if ($@ || $? != 0 || !defined $cleaned || $cleaned eq '') {
         return clean_fallback_regex($content);
     }
 
