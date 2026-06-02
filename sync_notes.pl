@@ -8,6 +8,7 @@ use Mojo::JSON qw(encode_json decode_json);
 use Digest::MD5 qw(md5_hex);
 use POSIX qw(strftime);
 use File::Temp qw(tempfile);
+use Encode qw(decode_utf8);
 
 # Ensure standard output uses UTF-8 encoding
 binmode(STDOUT, ":utf8");
@@ -37,6 +38,7 @@ my $dbh = DBI->connect($DB_DSN, $DB_USER, $DB_PASS, {
                        pg_enable_utf8    => 1,
 }) or die "Could not connect to database: $DBI::errstr";
 
+# Insert query utilizing message_id (content hash) as a unique constraint to avoid duplicates
 my $sth_insert_email = $dbh->prepare(q{
                                      INSERT INTO emails (imap_uid, mailbox, message_id, subject, sender, recipient, date_sent, is_unread, body_text, body_html, raw_mime)
                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -67,11 +69,14 @@ if ($FOLDER_FILTER ne '') {
     $cmd .= " -f " . quotemeta($FOLDER_FILTER);
 }
 
-my @list_output = `$cmd`;
+# Capture command output as raw bytes
+my @list_output_bytes = `$cmd`;
 if ($? != 0) {
     die "Error: Failed to execute '$cmd'. Ensure 'memo' is installed and authorized to access Apple Notes.\n";
 }
 
+# Explicitly decode raw terminal bytes to Perl character strings
+my @list_output = map { decode_utf8($_) } @list_output_bytes;
 my $synced_count = 0;
 
 foreach my $line (@list_output) {
@@ -85,12 +90,15 @@ foreach my $line (@list_output) {
 
         print "Processing Note Index $index: [$title]... ";
 
-        my $content = `memo notes -v $index`;
-        if ($? != 0 || !defined $content || $content eq '') {
+        # Capture raw bytes of note contents
+        my $content_bytes = `memo notes -v $index`;
+        if ($? != 0 || !defined $content_bytes || $content_bytes eq '') {
             print "Failed to fetch content. Skipping.\n";
             next;
         }
         
+        # Explicitly decode contents to Perl character string
+        my $content = decode_utf8($content_bytes);
         $content =~ s/\e\[[0-9;]*[a-zA-Z]//g;
 
         # Extract subject from first line / paragraph
@@ -104,15 +112,17 @@ foreach my $line (@list_output) {
         # Clean formatting structure and binary chunks
         my $cleaned_body = clean_note_body($content);
         my $current_time = strftime("%Y-%m-%d %H:%M:%S", localtime);
-        my $message_id   = "apple-note-" . md5_hex($subject) . "\@local";
+        
+        # Fake Primary Key: md5 hash over the entire raw content to ensure 
+        # identical notes do not generate duplicate rows in the database.
+        my $message_id = "apple-note-" . md5_hex($content) . "\@local";
 
         # Truncate extensively long content specifically for the embedding payload
-        # This keeps representation dense and safe for Ollama's context limits
         my $truncated_body = length($cleaned_body) > 1200 
             ? substr($cleaned_body, 0, 1200) . " ... [TRUNCATED]" 
             : $cleaned_body;
 
-        # Build structural context block for vector embedding
+        # Build clean structural context block for vector embedding
         my $text_to_embed = sprintf(
             "Email Folder: %s\n" .
             "From: %s\n" .
@@ -196,9 +206,8 @@ sub clean_note_body {
     $body =~ s/(?<![a-fA-F0-9])[a-fA-F0-9]{80,}(?![a-fA-F0-9])//g;
 
     # 3. Only run Pandoc if we detect clear signs of rich text (RTF, HTML, complex Markdown).
-    # Otherwise, skip to prevent parser warnings, errors, or overhead.
     if (has_rich_text($body)) {
-        $body = clean_with_pandoc($body);
+        # $body = clean_with_pandoc($body);
     }
 
     # 4. Standard spacing cleanups
@@ -220,8 +229,8 @@ sub has_rich_text {
     # Clear signs of HTML markup
     return 1 if $text =~ /<html/si || $text =~ /<!DOCTYPE/si || $text =~ /<\/?[a-z][a-z0-9]*\b[^>]*>/si;
 
-    # Clear signs of standard Markdown structures
-    return 1 if $text =~ /^\s*#+\s+/m;              # Headers
+    # Clear signs of standard Markdown structures.
+    return 1 if $text =~ /^\s*#+\s+/m;              # Structural Markdown headers
     return 1 if $text =~ /\[[^\]]+\]\([^)]+\)/;     # Inline links
     return 1 if $text =~ /^[*-]\s+\S+/m;            # Unordered lists
     return 1 if $text =~ /^\d+\.\s+\S+/m;           # Numbered lists
